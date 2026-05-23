@@ -3,17 +3,17 @@
 use core::fmt;
 
 use alloc::{
+    collections::BTreeSet,
     string::{String, ToString},
     vec::Vec,
 };
-use std::collections::HashSet;
 
 /// Set of flags attached to an m2dir entry.
 ///
 /// Each flag is an arbitrary UTF-8 string; serialization to the
-/// `.meta/<id>.flags` sidecar is one flag per line.
-#[derive(Clone, Debug, Default)]
-pub struct Flags(HashSet<String>);
+/// `.meta/<id>.flags` metadata file is one flag per line.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Flags(BTreeSet<String>);
 
 impl Flags {
     /// Returns an iterator over the flags in this set.
@@ -59,21 +59,18 @@ impl Flags {
 
     /// Serializes the flag set to its on-disk `.flags` representation:
     /// one flag per line, deterministic alphabetical order.
-    pub fn to_sidecar(&self) -> String {
-        let mut sorted: Vec<&str> = self.0.iter().map(String::as_str).collect();
-        sorted.sort();
-
+    pub fn to_meta(&self) -> String {
         let mut out = String::new();
-        for flag in sorted {
+        for flag in &self.0 {
             out.push_str(flag);
             out.push('\n');
         }
         out
     }
 
-    /// Parses a `.flags` sidecar payload (one flag per line, blanks
+    /// Parses a `.flags` metadata payload (one flag per line, blanks
     /// ignored).
-    pub fn from_sidecar(contents: &str) -> Self {
+    pub fn from_meta(contents: &str) -> Self {
         Self(
             contents
                 .lines()
@@ -86,8 +83,7 @@ impl Flags {
 
 impl fmt::Display for Flags {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut sorted: Vec<&str> = self.0.iter().map(String::as_str).collect();
-        sorted.sort();
+        let sorted: Vec<&str> = self.0.iter().map(String::as_str).collect();
         write!(f, "{}", sorted.join(","))
     }
 }
@@ -104,13 +100,13 @@ impl<'a> FromIterator<&'a str> for Flags {
     }
 }
 
-impl From<HashSet<String>> for Flags {
-    fn from(set: HashSet<String>) -> Self {
+impl From<BTreeSet<String>> for Flags {
+    fn from(set: BTreeSet<String>) -> Self {
         Self(set)
     }
 }
 
-impl From<Flags> for HashSet<String> {
+impl From<Flags> for BTreeSet<String> {
     fn from(flags: Flags) -> Self {
         flags.0
     }
@@ -121,14 +117,14 @@ mod tests {
     use crate::flag::*;
 
     #[test]
-    fn sidecar_round_trip() {
+    fn meta_round_trip() {
         let mut flags = Flags::default();
         flags.insert("$seen");
         flags.insert("$forwarded");
         flags.insert("custom");
 
-        let serialized = flags.to_sidecar();
-        let parsed = Flags::from_sidecar(&serialized);
+        let serialized = flags.to_meta();
+        let parsed = Flags::from_meta(&serialized);
 
         assert_eq!(parsed.len(), 3);
         assert!(parsed.contains("$seen"));
@@ -137,17 +133,17 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_is_sorted() {
+    fn meta_is_sorted() {
         let mut flags = Flags::default();
         flags.insert("zeta");
         flags.insert("alpha");
         flags.insert("middle");
-        assert_eq!(flags.to_sidecar(), "alpha\nmiddle\nzeta\n");
+        assert_eq!(flags.to_meta(), "alpha\nmiddle\nzeta\n");
     }
 
     #[test]
-    fn from_sidecar_ignores_blanks() {
-        let parsed = Flags::from_sidecar("$seen\n\n\n$forwarded\n");
+    fn from_meta_ignores_blanks() {
+        let parsed = Flags::from_meta("$seen\n\n\n$forwarded\n");
         assert_eq!(parsed.len(), 2);
         assert!(parsed.contains("$seen"));
         assert!(parsed.contains("$forwarded"));

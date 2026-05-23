@@ -1,11 +1,11 @@
 [package]
 name = "io-m2dir"
-description = "Sans-I/O coroutines for the m2dir mail storage format, with optional blocking std client."
+description = "M2dir client library"
 version = "0.0.1"
-authors = ["Clément DOUIN <pimalaya.org@posteo.net>"]
+authors = ["soywod <pimalaya.org@posteo.net>"]
 edition = "2024"
 rust-version = "1.87"
-license = "LGPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 categories = ["email", "filesystem"]
 keywords = ["email", "m2dir", "client", "io-free"]
 homepage = "https://pimalaya.org"
@@ -17,7 +17,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["client"]
+default = []
 client = []
 
 [dev-dependencies]

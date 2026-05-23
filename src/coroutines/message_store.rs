@@ -5,64 +5,79 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use alloc::{
-    collections::BTreeMap,
-    string::{String, ToString},
-    vec::Vec,
-};
-use std::{path::PathBuf, process};
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 
 use log::trace;
 use thiserror::Error;
 
 use crate::entry::Entry;
 use crate::m2dir::M2dir;
-use crate::rand::random_bytes;
+use crate::path::M2dirPath;
+
+const NONCE_LEN: usize = 4;
 
 static TMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
-pub enum MessageStoreError {
+pub enum M2dirMessageStoreError {
     #[error("Invalid m2dir message store arg {0:?} for state {1:?}")]
-    Invalid(Option<MessageStoreArg>, State),
+    Invalid(Option<M2dirMessageStoreArg>, State),
 }
 
-/// Result returned by [`MessageStore::resume`].
+/// Result returned by [`M2dirMessageStore::resume`].
 #[derive(Clone, Debug)]
-pub enum MessageStoreResult {
+pub enum M2dirMessageStoreResult {
     /// The coroutine has successfully terminated its progression.
     Ok(Entry),
-
+    /// The caller must provide the current process id and feed back
+    /// [`M2dirMessageStoreArg::Pid`].
+    WantsPid,
+    /// The caller must provide `len` random bytes and feed back
+    /// [`M2dirMessageStoreArg::Random`].
+    WantsRandom { len: usize },
     /// The caller must write the given files with the given contents
-    /// and feed back [`MessageStoreArg::FileCreate`].
-    WantsFileCreate(BTreeMap<String, Vec<u8>>),
-
+    /// and feed back [`M2dirMessageStoreArg::FileCreate`].
+    WantsFileCreate(BTreeMap<M2dirPath, Vec<u8>>),
     /// The caller must rename each `(from, to)` pair and feed back
-    /// [`MessageStoreArg::Rename`].
-    WantsRename(Vec<(String, String)>),
-
+    /// [`M2dirMessageStoreArg::Rename`].
+    WantsRename(Vec<(M2dirPath, M2dirPath)>),
     /// The coroutine encountered an error.
-    Err(MessageStoreError),
+    Err(M2dirMessageStoreError),
 }
 
-/// Internal progression state of [`MessageStore`].
+/// Internal progression state of [`M2dirMessageStore`].
 #[derive(Clone, Debug, Default)]
 pub enum State {
     Start(Vec<u8>),
-    Created,
-    Renamed,
+    AwaitingPid(Vec<u8>),
+    AwaitingRandom {
+        bytes: Vec<u8>,
+        pid: u32,
+    },
+    Created {
+        tmp_path: M2dirPath,
+        final_path: M2dirPath,
+        id: String,
+    },
+    Renamed {
+        final_path: M2dirPath,
+        id: String,
+    },
     #[default]
     Invalid,
 }
 
-/// Argument fed back to [`MessageStore::resume`].
+/// Argument fed back to [`M2dirMessageStore::resume`].
 #[derive(Clone, Debug)]
-pub enum MessageStoreArg {
-    /// Response to [`MessageStoreResult::WantsFileCreate`].
+pub enum M2dirMessageStoreArg {
+    /// Response to [`M2dirMessageStoreResult::WantsPid`].
+    Pid(u32),
+    /// Response to [`M2dirMessageStoreResult::WantsRandom`].
+    Random(Vec<u8>),
+    /// Response to [`M2dirMessageStoreResult::WantsFileCreate`].
     FileCreate,
-
-    /// Response to [`MessageStoreResult::WantsRename`].
+    /// Response to [`M2dirMessageStoreResult::WantsRename`].
     Rename,
 }
 
@@ -72,27 +87,17 @@ pub enum MessageStoreArg {
 /// in the same directory first, then atomically rename to
 /// `<date>,<checksum>.<nonce>`.
 #[derive(Debug)]
-pub struct MessageStore {
-    id: String,
-    tmp_path: String,
-    final_path: String,
+pub struct M2dirMessageStore {
+    m2dir: M2dir,
     state: State,
 }
 
-impl MessageStore {
-    /// Creates a new coroutine that will store `bytes` as a new entry
-    /// in `m2dir`.
-    pub fn new(m2dir: &M2dir, bytes: Vec<u8>) -> Self {
-        let nonce_bytes: Vec<u8> = random_bytes().take(4).collect();
-        let (id, final_path) = m2dir.entry_path(&bytes, &nonce_bytes);
-
-        let counter = TMP_COUNTER.fetch_add(1, Ordering::AcqRel);
-        let tmp_path = m2dir.tmp_path(process::id(), counter);
-
+impl M2dirMessageStore {
+    /// Creates a new coroutine that will store `bytes` as a new
+    /// entry in `m2dir`.
+    pub fn new(m2dir: M2dir, bytes: Vec<u8>) -> Self {
         Self {
-            id,
-            tmp_path: tmp_path.to_string_lossy().into_owned(),
-            final_path: final_path.to_string_lossy().into_owned(),
+            m2dir,
             state: State::Start(bytes),
         }
     }
@@ -100,32 +105,57 @@ impl MessageStore {
     /// Makes the message store progress.
     pub fn resume(
         &mut self,
-        arg: Option<impl Into<MessageStoreArg>>,
-    ) -> MessageStoreResult {
+        arg: Option<impl Into<M2dirMessageStoreArg>>,
+    ) -> M2dirMessageStoreResult {
         match (mem::take(&mut self.state), arg.map(Into::into)) {
             (State::Start(bytes), None) => {
-                trace!("wants tmp file create at {}", self.tmp_path);
-
-                let files = BTreeMap::from_iter([(self.tmp_path.clone(), bytes)]);
-                self.state = State::Created;
-                MessageStoreResult::WantsFileCreate(files)
+                trace!("wants pid");
+                self.state = State::AwaitingPid(bytes);
+                M2dirMessageStoreResult::WantsPid
             }
-            (State::Created, Some(MessageStoreArg::FileCreate)) => {
-                trace!("created tmp file, wants rename to {}", self.final_path);
-
-                let pairs = vec![(self.tmp_path.clone(), self.final_path.clone())];
-                self.state = State::Renamed;
-                MessageStoreResult::WantsRename(pairs)
+            (State::AwaitingPid(bytes), Some(M2dirMessageStoreArg::Pid(pid))) => {
+                trace!("wants {NONCE_LEN} random bytes");
+                self.state = State::AwaitingRandom { bytes, pid };
+                M2dirMessageStoreResult::WantsRandom { len: NONCE_LEN }
             }
-            (State::Renamed, Some(MessageStoreArg::Rename)) => {
-                trace!("renamed tmp file to {}", self.final_path);
+            (State::AwaitingRandom { bytes, pid }, Some(M2dirMessageStoreArg::Random(nonce))) => {
+                let (id, final_path) = self.m2dir.entry_path(&bytes, &nonce);
+                let counter = TMP_COUNTER.fetch_add(1, Ordering::AcqRel);
+                let tmp_path = self.m2dir.tmp_path(pid, counter);
 
-                let entry = Entry::from_parts(self.id.clone(), PathBuf::from(&self.final_path));
-                MessageStoreResult::Ok(entry)
+                trace!("wants tmp file create at {tmp_path}");
+
+                let files = BTreeMap::from_iter([(tmp_path.clone(), bytes)]);
+                self.state = State::Created {
+                    tmp_path,
+                    final_path,
+                    id,
+                };
+                M2dirMessageStoreResult::WantsFileCreate(files)
+            }
+            (
+                State::Created {
+                    tmp_path,
+                    final_path,
+                    id,
+                },
+                Some(M2dirMessageStoreArg::FileCreate),
+            ) => {
+                trace!("created tmp file, wants rename to {final_path}");
+
+                let pairs = vec![(tmp_path, final_path.clone())];
+                self.state = State::Renamed { final_path, id };
+                M2dirMessageStoreResult::WantsRename(pairs)
+            }
+            (State::Renamed { final_path, id }, Some(M2dirMessageStoreArg::Rename)) => {
+                trace!("renamed tmp file to {final_path}");
+
+                let entry = Entry::from_parts(id, final_path);
+                M2dirMessageStoreResult::Ok(entry)
             }
             (state, arg) => {
-                let err = MessageStoreError::Invalid(arg, state);
-                MessageStoreResult::Err(err)
+                let err = M2dirMessageStoreError::Invalid(arg, state);
+                M2dirMessageStoreResult::Err(err)
             }
         }
     }

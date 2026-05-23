@@ -4,67 +4,72 @@ use core::mem;
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
-    string::String,
+    string::{String, ToString},
     vec::Vec,
 };
-use std::{collections::HashSet, path::PathBuf};
 
 use log::trace;
 use thiserror::Error;
 
-use crate::entry::Entry;
-use crate::m2dir::M2dir;
+use crate::{entry::Entry, m2dir::M2dir, path::M2dirPath};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
-pub enum MessageListError {
+pub enum M2dirMessageListError {
     #[error("Invalid m2dir message list arg {0:?} for state {1:?}")]
-    Invalid(Option<MessageListArg>, State),
+    Invalid(Option<M2dirMessageListArg>, State),
 }
 
-/// Result returned by [`MessageList::resume`].
+/// Result returned by [`M2dirMessageList::resume`].
 #[derive(Clone, Debug)]
-pub enum MessageListResult {
+pub enum M2dirMessageListResult {
     /// The coroutine has successfully terminated its progression.
     Ok(Vec<Entry>),
-
-    /// The caller must read the entries of the given directories and
-    /// feed back [`MessageListArg::DirRead`].
-    WantsDirRead(BTreeSet<String>),
-
+    /// The caller must read the entries of the given directories
+    /// and feed back [`M2dirMessageListArg::DirRead`].
+    WantsDirRead(BTreeSet<M2dirPath>),
+    /// The caller must check whether the given paths exist as
+    /// regular files and feed back
+    /// [`M2dirMessageListArg::FileExists`].
+    WantsFileExists(BTreeSet<M2dirPath>),
     /// The coroutine encountered an error.
-    Err(MessageListError),
+    Err(M2dirMessageListError),
 }
 
-/// Internal progression state of [`MessageList`].
+/// Internal progression state of [`M2dirMessageList`].
 #[derive(Clone, Debug, Default)]
 pub enum State {
     Start(M2dir),
-    Read,
+    Reading,
+    Checking {
+        candidates: BTreeMap<M2dirPath, String>,
+    },
     #[default]
     Invalid,
 }
 
-/// Argument fed back to [`MessageList::resume`].
+/// Argument fed back to [`M2dirMessageList::resume`].
 #[derive(Clone, Debug)]
-pub enum MessageListArg {
-    /// Response to [`MessageListResult::WantsDirRead`].
-    DirRead(BTreeMap<String, BTreeSet<String>>),
+pub enum M2dirMessageListArg {
+    /// Response to [`M2dirMessageListResult::WantsDirRead`].
+    DirRead(BTreeMap<M2dirPath, BTreeSet<M2dirPath>>),
+    /// Response to [`M2dirMessageListResult::WantsFileExists`].
+    FileExists(BTreeMap<M2dirPath, bool>),
 }
 
 /// I/O-free coroutine to list every entry inside an [`M2dir`].
 ///
 /// Dotfiles and sub-directories are skipped. Filenames that do not
-/// match the m2dir specification (no `,` separator) are also skipped.
-/// Returned entries are not checksum-verified; use
-/// [`MessageGet`](crate::coroutines::message_get::MessageGet) when
-/// validation is required.
-#[derive(Debug)]
-pub struct MessageList {
+/// match the m2dir specification (no `,` separator) are also
+/// skipped. Returned entries are not checksum-verified; use
+/// [`M2dirMessageGet`](crate::coroutines::message_get::M2dirMessageGet)
+/// when validation is required.
+#[derive(Clone, Debug)]
+pub struct M2dirMessageList {
     state: State,
 }
 
-impl MessageList {
+impl M2dirMessageList {
     /// Creates a new coroutine that will list every entry inside
     /// `m2dir`.
     pub fn new(m2dir: M2dir) -> Self {
@@ -76,52 +81,64 @@ impl MessageList {
     /// Makes the listing progress.
     pub fn resume(
         &mut self,
-        arg: Option<impl Into<MessageListArg>>,
-    ) -> MessageListResult {
+        arg: Option<impl Into<M2dirMessageListArg>>,
+    ) -> M2dirMessageListResult {
         match (mem::take(&mut self.state), arg.map(Into::into)) {
             (State::Start(m2dir), None) => {
-                trace!("wants directory read of {}", m2dir.path().display());
+                trace!("wants directory read of {}", m2dir.path());
 
-                let path = m2dir.path().to_string_lossy().into_owned();
-                let paths = BTreeSet::from_iter([path]);
-
-                self.state = State::Read;
-                MessageListResult::WantsDirRead(paths)
+                let paths = BTreeSet::from_iter([m2dir.path().clone()]);
+                self.state = State::Reading;
+                M2dirMessageListResult::WantsDirRead(paths)
             }
-            (State::Read, Some(MessageListArg::DirRead(entries))) => {
-                let names = entries.into_values().next().unwrap_or_default();
+            (State::Reading, Some(M2dirMessageListArg::DirRead(entries))) => {
+                let mut candidates = BTreeMap::new();
+
+                for (_dir, names) in entries {
+                    for path in names {
+                        let Some(name) = path.file_name() else {
+                            continue;
+                        };
+
+                        if name.starts_with('.') {
+                            continue;
+                        }
+
+                        let Some(id) = M2dir::parse_filename_id(name) else {
+                            trace!("skipping unparseable entry filename: {name}");
+                            continue;
+                        };
+
+                        candidates.insert(path.clone(), id.to_string());
+                    }
+                }
+
+                if candidates.is_empty() {
+                    trace!("no candidate entries");
+                    return M2dirMessageListResult::Ok(Vec::new());
+                }
+
+                let probes: BTreeSet<M2dirPath> = candidates.keys().cloned().collect();
+                trace!("wants existence check for {} candidates", probes.len());
+
+                self.state = State::Checking { candidates };
+                M2dirMessageListResult::WantsFileExists(probes)
+            }
+            (State::Checking { candidates }, Some(M2dirMessageListArg::FileExists(probes))) => {
                 let mut found = Vec::new();
 
-                for path_str in names {
-                    let path = PathBuf::from(&path_str);
-
-                    let name = match path.file_name().and_then(|n| n.to_str()) {
-                        Some(name) => name,
-                        None => continue,
-                    };
-
-                    if name.starts_with('.') {
-                        continue;
+                for (path, id) in candidates {
+                    if probes.get(&path).copied().unwrap_or(false) {
+                        found.push(Entry::from_parts(id, path));
                     }
-
-                    if !path.is_file() {
-                        continue;
-                    }
-
-                    let Some(id) = M2dir::parse_filename_id(name) else {
-                        trace!("skipping unparseable entry filename: {name}");
-                        continue;
-                    };
-
-                    found.push(Entry::from_parts(id, path));
                 }
 
                 trace!("found {} entries", found.len());
-                MessageListResult::Ok(found)
+                M2dirMessageListResult::Ok(found)
             }
             (state, arg) => {
-                let err = MessageListError::Invalid(arg, state);
-                MessageListResult::Err(err)
+                let err = M2dirMessageListError::Invalid(arg, state);
+                M2dirMessageListResult::Err(err)
             }
         }
     }

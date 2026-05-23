@@ -8,22 +8,14 @@ extern crate alloc;
 extern crate std;
 
 pub mod base64;
-pub mod fnv;
-pub mod parse;
-
 #[cfg(feature = "client")]
 pub mod client;
-#[cfg(feature = "client")]
 pub mod coroutines;
-#[cfg(feature = "client")]
 pub mod entry;
-#[cfg(feature = "client")]
 pub mod flag;
-#[cfg(feature = "client")]
+pub mod fnv;
 pub mod m2dir;
-#[cfg(feature = "client")]
 pub mod m2store;
-#[cfg(feature = "client")]
+pub mod parse;
+pub mod path;
 pub mod percent;
-#[cfg(feature = "client")]
-pub mod rand;

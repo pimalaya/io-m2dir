@@ -7,9 +7,9 @@
 //! matching operation and feeds the corresponding `*Arg` variant back
 //! into the next `resume` call to make progress.
 
-pub mod flags_add;
-pub mod flags_remove;
-pub mod flags_set;
+pub mod flag_add;
+pub mod flag_remove;
+pub mod flag_set;
 pub mod mailbox_create;
 pub mod mailbox_delete;
 pub mod mailbox_list;

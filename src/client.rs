@@ -1,75 +1,68 @@
 //! Standard, blocking m2dir client.
 //!
-//! Holds a single filesystem root [`PathBuf`] and exposes one method
-//! per coroutine. Every method runs its coroutine to completion by
-//! performing the requested filesystem operations via [`std::fs`] in a
-//! resume loop.
+//! Holds a single filesystem root and exposes one method per
+//! coroutine. Every method runs its coroutine to completion by
+//! performing the requested filesystem operations via [`std::fs`]
+//! in a resume loop.
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
-    string::{String, ToString},
+    string::ToString,
     vec::Vec,
 };
 use std::{
-    collections::HashSet,
-    fs, io,
+    collections::hash_map::RandomState,
+    fs,
+    hash::{BuildHasher, Hasher},
+    io,
     path::{Path, PathBuf},
+    process,
 };
 
 use log::trace;
 use thiserror::Error;
 
-use crate::coroutines::{
-    flags_add::*, flags_remove::*, flags_set::*, mailbox_create::*, mailbox_delete::*,
-    mailbox_list::*, message_delete::*, message_get::*, message_list::*, message_store::*,
+use crate::{
+    coroutines::{
+        flag_add::*, flag_remove::*, flag_set::*, mailbox_create::*, mailbox_delete::*,
+        mailbox_list::*, message_delete::*, message_get::*, message_list::*, message_store::*,
+    },
+    entry::Entry,
+    flag::Flags,
+    m2dir::{DOT_M2DIR, LoadM2dirError, M2dir},
+    m2store::{DOT_M2STORE, LoadM2storeError, M2store, NewFolderError},
+    path::M2dirPath,
 };
-use crate::entry::Entry;
-use crate::flag::Flags;
-use crate::m2dir::{LoadM2dirError, M2dir};
-use crate::m2store::{LoadM2storeError, M2store, NewFolderError};
 
 /// Errors returned by [`M2dirClient`].
 #[derive(Debug, Error)]
 pub enum M2dirClientError {
     #[error(transparent)]
     LoadM2store(#[from] LoadM2storeError),
-
     #[error(transparent)]
     LoadM2dir(#[from] LoadM2dirError),
-
     #[error(transparent)]
     NewFolder(#[from] NewFolderError),
-
     #[error(transparent)]
-    MailboxCreate(#[from] MailboxCreateError),
-
+    CreateMailbox(#[from] M2dirMailboxCreateError),
     #[error(transparent)]
-    MailboxDelete(#[from] MailboxDeleteError),
-
+    DeleteMailbox(#[from] M2dirMailboxDeleteError),
     #[error(transparent)]
-    MailboxList(#[from] MailboxListError),
-
+    ListMailboxes(#[from] M2dirMailboxListError),
     #[error(transparent)]
-    MessageList(#[from] MessageListError),
-
+    ListMessages(#[from] M2dirMessageListError),
     #[error(transparent)]
-    MessageGet(#[from] MessageGetError),
-
+    GetMessage(#[from] M2dirMessageGetError),
     #[error(transparent)]
-    MessageStore(#[from] MessageStoreError),
-
+    StoreMessage(#[from] M2dirMessageStoreError),
     #[error(transparent)]
-    MessageDelete(#[from] MessageDeleteError),
-
+    DeleteMessage(#[from] M2dirMessageDeleteError),
     #[error(transparent)]
-    FlagsAdd(#[from] FlagsAddError),
-
+    AddFlags(#[from] M2dirFlagAddError),
     #[error(transparent)]
-    FlagsRemove(#[from] FlagsRemoveError),
-
+    RemoveFlags(#[from] M2dirFlagRemoveError),
     #[error(transparent)]
-    FlagsSet(#[from] FlagsSetError),
-
+    SetFlags(#[from] M2dirFlagSetError),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -81,342 +74,400 @@ pub enum M2dirClientError {
 /// this root.
 #[derive(Debug)]
 pub struct M2dirClient {
-    root: PathBuf,
+    root: M2dirPath,
 }
 
 impl M2dirClient {
     /// Builds a client rooted at `root`. No filesystem check is
     /// performed at construction time.
-    pub fn new(root: impl Into<PathBuf>) -> Self {
+    pub fn new(root: impl Into<M2dirPath>) -> Self {
         Self { root: root.into() }
     }
 
     /// Returns the filesystem root this client operates on.
-    pub fn root(&self) -> &Path {
+    pub fn root(&self) -> &M2dirPath {
         &self.root
     }
 
-    /// Opens the m2store at the client root, returning a typed handle
-    /// on success.
+    /// Opens the m2store at the client root, returning a typed
+    /// handle on success.
     pub fn open_store(&self) -> Result<M2store, M2dirClientError> {
-        Ok(M2store::try_from(self.root.clone())?)
+        load_m2store(self.root.clone()).map_err(Into::into)
     }
 
     /// Initialises a brand new m2store at the client root: creates
     /// the directory if needed and writes the `.m2store` marker.
     pub fn init_store(&self) -> Result<M2store, M2dirClientError> {
-        trace!("init m2store at {}", self.root.display());
+        trace!("init m2store at {}", self.root);
 
-        fs::create_dir_all(&self.root)?;
-        let marker = self.root.join(crate::m2store::DOT_M2STORE);
-        if !marker.exists() {
-            fs::write(&marker, b"")?;
+        fs::create_dir_all(self.root.as_str())?;
+        let marker = self.root.join(DOT_M2STORE);
+        if !Path::new(marker.as_str()).exists() {
+            fs::write(marker.as_str(), b"")?;
         }
 
         Ok(M2store::from_path(self.root.clone()))
     }
 
-    // ---- Mailbox lifecycle ----------------------------------------------
+    /// Opens an existing m2dir at `path`, validating the `.m2dir`
+    /// marker.
+    pub fn open_m2dir(&self, path: impl Into<M2dirPath>) -> Result<M2dir, M2dirClientError> {
+        load_m2dir(path.into()).map_err(Into::into)
+    }
 
-    /// Runs [`MailboxCreate`]: creates the m2dir folder `name` and
-    /// writes the `.m2dir` marker.
-    pub fn create_mailbox(&self, name: impl AsRef<str>) -> Result<M2dir, M2dirClientError> {
+    // ---- Mailbox lifecycle --------------------------------------
+
+    /// Creates the m2dir folder `name` and writes the `.m2dir`
+    /// marker.
+    pub fn create_mailbox(&self, name: &str) -> Result<M2dir, M2dirClientError> {
         let store = self.open_store()?;
-        let mut coroutine = MailboxCreate::new(&store, name)?;
-        let mut arg: Option<MailboxCreateArg> = None;
+        let mut coroutine = M2dirMailboxCreate::new(&store, name)?;
+        let mut arg: Option<M2dirMailboxCreateArg> = None;
 
         loop {
             match coroutine.resume(arg.take()) {
-                MailboxCreateResult::Ok(m2dir) => return Ok(m2dir),
-                MailboxCreateResult::WantsDirCreate(paths) => {
+                M2dirMailboxCreateResult::Ok(m2dir) => return Ok(m2dir),
+                M2dirMailboxCreateResult::WantsDirCreate(paths) => {
                     create_dirs(paths)?;
-                    arg = Some(MailboxCreateArg::DirCreate);
+                    arg = Some(M2dirMailboxCreateArg::DirCreate);
                 }
-                MailboxCreateResult::WantsFileCreate(files) => {
+                M2dirMailboxCreateResult::WantsFileCreate(files) => {
                     write_files(files)?;
-                    arg = Some(MailboxCreateArg::FileCreate);
+                    arg = Some(M2dirMailboxCreateArg::FileCreate);
                 }
-                MailboxCreateResult::Err(err) => return Err(err.into()),
+                M2dirMailboxCreateResult::Err(err) => return Err(err.into()),
             }
         }
     }
 
-    /// Runs [`MailboxDelete`]: recursively removes the m2dir at
-    /// `path`.
-    pub fn delete_mailbox(&self, path: impl AsRef<Path>) -> Result<(), M2dirClientError> {
-        let mut coroutine = MailboxDelete::new(path);
-        let mut arg: Option<MailboxDeleteArg> = None;
+    /// Recursively removes the m2dir at `path`.
+    pub fn delete_mailbox(&self, path: impl Into<M2dirPath>) -> Result<(), M2dirClientError> {
+        let mut coroutine = M2dirMailboxDelete::new(path);
+        let mut arg: Option<M2dirMailboxDeleteArg> = None;
 
         loop {
             match coroutine.resume(arg.take()) {
-                MailboxDeleteResult::Ok => return Ok(()),
-                MailboxDeleteResult::WantsDirRemove(paths) => {
+                M2dirMailboxDeleteResult::Ok => return Ok(()),
+                M2dirMailboxDeleteResult::WantsDirRemove(paths) => {
                     remove_dirs(paths)?;
-                    arg = Some(MailboxDeleteArg::DirRemove);
+                    arg = Some(M2dirMailboxDeleteArg::DirRemove);
                 }
-                MailboxDeleteResult::Err(err) => return Err(err.into()),
+                M2dirMailboxDeleteResult::Err(err) => return Err(err.into()),
             }
         }
     }
 
-    /// Runs [`MailboxList`]: returns every m2dir found under the
-    /// store root.
-    pub fn list_mailboxes(&self) -> Result<HashSet<M2dir>, M2dirClientError> {
+    /// Lists every m2dir under the store root.
+    pub fn list_mailboxes(&self) -> Result<BTreeSet<M2dir>, M2dirClientError> {
         let store = self.open_store()?;
-        let mut coroutine = MailboxList::new(&store);
-        let mut arg: Option<MailboxListArg> = None;
+        let mut coroutine = M2dirMailboxList::new(&store);
+        let mut arg: Option<M2dirMailboxListArg> = None;
 
         loop {
             match coroutine.resume(arg.take()) {
-                MailboxListResult::Ok(found) => return Ok(found),
-                MailboxListResult::WantsDirRead(paths) => {
+                M2dirMailboxListResult::Ok(found) => return Ok(found),
+                M2dirMailboxListResult::WantsDirRead(paths) => {
                     let entries = read_dirs(paths)?;
-                    arg = Some(MailboxListArg::DirRead(entries));
+                    arg = Some(M2dirMailboxListArg::DirRead(entries));
                 }
-                MailboxListResult::Err(err) => return Err(err.into()),
+                M2dirMailboxListResult::WantsFileExists(paths) => {
+                    let probes = file_exists(paths);
+                    arg = Some(M2dirMailboxListArg::FileExists(probes));
+                }
+                M2dirMailboxListResult::Err(err) => return Err(err.into()),
             }
         }
     }
 
-    // ---- Messages -------------------------------------------------------
+    // ---- Messages -----------------------------------------------
 
-    /// Runs [`MessageList`]: returns every entry inside `m2dir`.
+    /// Lists every entry inside `m2dir`.
     pub fn list_messages(&self, m2dir: M2dir) -> Result<Vec<Entry>, M2dirClientError> {
-        let mut coroutine = MessageList::new(m2dir);
-        let mut arg: Option<MessageListArg> = None;
+        let mut coroutine = M2dirMessageList::new(m2dir);
+        let mut arg: Option<M2dirMessageListArg> = None;
 
         loop {
             match coroutine.resume(arg.take()) {
-                MessageListResult::Ok(entries) => return Ok(entries),
-                MessageListResult::WantsDirRead(paths) => {
+                M2dirMessageListResult::Ok(entries) => return Ok(entries),
+                M2dirMessageListResult::WantsDirRead(paths) => {
                     let entries = read_dirs(paths)?;
-                    arg = Some(MessageListArg::DirRead(entries));
+                    arg = Some(M2dirMessageListArg::DirRead(entries));
                 }
-                MessageListResult::Err(err) => return Err(err.into()),
+                M2dirMessageListResult::WantsFileExists(paths) => {
+                    let probes = file_exists(paths);
+                    arg = Some(M2dirMessageListArg::FileExists(probes));
+                }
+                M2dirMessageListResult::Err(err) => return Err(err.into()),
             }
         }
     }
 
-    /// Runs [`MessageGet`]: locates and reads entry `id` from
-    /// `m2dir`, validating the checksum embedded in the filename.
+    /// Locates and reads entry `id` from `m2dir`, validating the
+    /// checksum embedded in the filename.
     pub fn get(
         &self,
         m2dir: M2dir,
         id: impl ToString,
     ) -> Result<(Entry, Vec<u8>), M2dirClientError> {
-        let mut coroutine = MessageGet::new(m2dir, id);
-        let mut arg: Option<MessageGetArg> = None;
+        let mut coroutine = M2dirMessageGet::new(m2dir, id);
+        let mut arg: Option<M2dirMessageGetArg> = None;
 
         loop {
             match coroutine.resume(arg.take()) {
-                MessageGetResult::Ok { entry, contents } => return Ok((entry, contents)),
-                MessageGetResult::WantsDirRead(paths) => {
+                M2dirMessageGetResult::Ok { entry, contents } => return Ok((entry, contents)),
+                M2dirMessageGetResult::WantsDirRead(paths) => {
                     let entries = read_dirs(paths)?;
-                    arg = Some(MessageGetArg::DirRead(entries));
+                    arg = Some(M2dirMessageGetArg::DirRead(entries));
                 }
-                MessageGetResult::WantsFileRead(paths) => {
+                M2dirMessageGetResult::WantsFileExists(paths) => {
+                    let probes = file_exists(paths);
+                    arg = Some(M2dirMessageGetArg::FileExists(probes));
+                }
+                M2dirMessageGetResult::WantsFileRead(paths) => {
                     let files = read_files(paths)?;
-                    arg = Some(MessageGetArg::FileRead(files));
+                    arg = Some(M2dirMessageGetArg::FileRead(files));
                 }
-                MessageGetResult::Err(err) => return Err(err.into()),
+                M2dirMessageGetResult::Err(err) => return Err(err.into()),
             }
         }
     }
 
-    /// Runs [`MessageStore`]: writes `bytes` to a temporary file
-    /// inside `m2dir`, then atomically renames it to its checksum-
-    /// based final filename.
-    pub fn store(&self, m2dir: &M2dir, bytes: Vec<u8>) -> Result<Entry, M2dirClientError> {
-        let mut coroutine = MessageStore::new(m2dir, bytes);
-        let mut arg: Option<MessageStoreArg> = None;
+    /// Writes `bytes` to a temporary file inside `m2dir`, then
+    /// atomically renames it to its checksum-based final filename.
+    pub fn store(&self, m2dir: M2dir, bytes: Vec<u8>) -> Result<Entry, M2dirClientError> {
+        let mut coroutine = M2dirMessageStore::new(m2dir, bytes);
+        let mut arg: Option<M2dirMessageStoreArg> = None;
 
         loop {
             match coroutine.resume(arg.take()) {
-                MessageStoreResult::Ok(entry) => return Ok(entry),
-                MessageStoreResult::WantsFileCreate(files) => {
+                M2dirMessageStoreResult::Ok(entry) => return Ok(entry),
+                M2dirMessageStoreResult::WantsPid => {
+                    arg = Some(M2dirMessageStoreArg::Pid(process::id()));
+                }
+                M2dirMessageStoreResult::WantsRandom { len } => {
+                    arg = Some(M2dirMessageStoreArg::Random(random_bytes(len)));
+                }
+                M2dirMessageStoreResult::WantsFileCreate(files) => {
                     write_files(files)?;
-                    arg = Some(MessageStoreArg::FileCreate);
+                    arg = Some(M2dirMessageStoreArg::FileCreate);
                 }
-                MessageStoreResult::WantsRename(pairs) => {
+                M2dirMessageStoreResult::WantsRename(pairs) => {
                     rename_paths(pairs)?;
-                    arg = Some(MessageStoreArg::Rename);
+                    arg = Some(M2dirMessageStoreArg::Rename);
                 }
-                MessageStoreResult::Err(err) => return Err(err.into()),
+                M2dirMessageStoreResult::Err(err) => return Err(err.into()),
             }
         }
     }
 
-    /// Runs [`MessageDelete`]: removes entry `id` and every matching
-    /// `.meta/<id>*` sidecar.
-    pub fn delete_message(
-        &self,
-        m2dir: M2dir,
-        id: impl ToString,
-    ) -> Result<(), M2dirClientError> {
-        let mut coroutine = MessageDelete::new(m2dir, id);
-        let mut arg: Option<MessageDeleteArg> = None;
+    /// Removes entry `id` and every matching `.meta/<id>*` file.
+    pub fn delete_message(&self, m2dir: M2dir, id: impl ToString) -> Result<(), M2dirClientError> {
+        let mut coroutine = M2dirMessageDelete::new(m2dir, id);
+        let mut arg: Option<M2dirMessageDeleteArg> = None;
 
         loop {
             match coroutine.resume(arg.take()) {
-                MessageDeleteResult::Ok => return Ok(()),
-                MessageDeleteResult::WantsDirRead(paths) => {
+                M2dirMessageDeleteResult::Ok => return Ok(()),
+                M2dirMessageDeleteResult::WantsDirRead(paths) => {
                     let entries = read_dirs(paths)?;
-                    arg = Some(MessageDeleteArg::DirRead(entries));
+                    arg = Some(M2dirMessageDeleteArg::DirRead(entries));
                 }
-                MessageDeleteResult::WantsFileRemove(paths) => {
+                M2dirMessageDeleteResult::WantsFileExists(paths) => {
+                    let probes = file_exists(paths);
+                    arg = Some(M2dirMessageDeleteArg::FileExists(probes));
+                }
+                M2dirMessageDeleteResult::WantsFileRemove(paths) => {
                     remove_files(paths)?;
-                    arg = Some(MessageDeleteArg::FileRemove);
+                    arg = Some(M2dirMessageDeleteArg::FileRemove);
                 }
-                MessageDeleteResult::Err(err) => return Err(err.into()),
+                M2dirMessageDeleteResult::Err(err) => return Err(err.into()),
             }
         }
     }
 
-    // ---- Flags ----------------------------------------------------------
+    // ---- Flags --------------------------------------------------
 
-    /// Reads the `.flags` sidecar for entry `id` inside `m2dir`,
-    /// returning an empty set if the file is missing.
+    /// Reads the `.flags` metadata file for entry `id` inside
+    /// `m2dir`, returning an empty set if the file is missing.
     pub fn read_flags(
         &self,
         m2dir: &M2dir,
         id: impl AsRef<str>,
     ) -> Result<Flags, M2dirClientError> {
-        let path = m2dir.flags_sidecar_path(id.as_ref());
-        trace!("read flags sidecar at {}", path.display());
+        let path = m2dir.flags_path(id.as_ref());
+        trace!("read flags at {path}");
 
-        match fs::read_to_string(&path) {
-            Ok(text) => Ok(Flags::from_sidecar(&text)),
+        match fs::read_to_string(path.as_str()) {
+            Ok(text) => Ok(Flags::from_meta(&text)),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Flags::default()),
             Err(err) => Err(err.into()),
         }
     }
 
-    /// Runs [`FlagsAdd`]: adds `flags` to entry `id`'s sidecar.
+    /// Adds `flags` to entry `id`'s flags metadata file.
     pub fn add_flags(
         &self,
         m2dir: &M2dir,
         id: impl AsRef<str>,
         flags: Flags,
     ) -> Result<(), M2dirClientError> {
-        let mut coroutine = FlagsAdd::new(m2dir, id, flags);
-        let mut arg: Option<FlagsAddArg> = None;
+        let mut coroutine = M2dirFlagAdd::new(m2dir, id, flags);
+        let mut arg: Option<M2dirFlagAddArg> = None;
 
         loop {
             match coroutine.resume(arg.take()) {
-                FlagsAddResult::Ok => return Ok(()),
-                FlagsAddResult::WantsFileRead(paths) => {
+                M2dirFlagAddResult::Ok => return Ok(()),
+                M2dirFlagAddResult::WantsFileRead(paths) => {
                     let files = read_files_tolerant(paths)?;
-                    arg = Some(FlagsAddArg::FileRead(files));
+                    arg = Some(M2dirFlagAddArg::FileRead(files));
                 }
-                FlagsAddResult::WantsFileCreate(files) => {
+                M2dirFlagAddResult::WantsFileCreate(files) => {
                     write_files(files)?;
-                    arg = Some(FlagsAddArg::FileCreate);
+                    arg = Some(M2dirFlagAddArg::FileCreate);
                 }
-                FlagsAddResult::Err(err) => return Err(err.into()),
+                M2dirFlagAddResult::Err(err) => return Err(err.into()),
             }
         }
     }
 
-    /// Runs [`FlagsRemove`]: removes `flags` from entry `id`'s
-    /// sidecar. When the resulting set is empty the sidecar file is
-    /// deleted.
+    /// Removes `flags` from entry `id`'s flags metadata file. When
+    /// the resulting set is empty the file is deleted.
     pub fn remove_flags(
         &self,
         m2dir: &M2dir,
         id: impl AsRef<str>,
         flags: Flags,
     ) -> Result<(), M2dirClientError> {
-        let mut coroutine = FlagsRemove::new(m2dir, id, flags);
-        let mut arg: Option<FlagsRemoveArg> = None;
+        let mut coroutine = M2dirFlagRemove::new(m2dir, id, flags);
+        let mut arg: Option<M2dirFlagRemoveArg> = None;
 
         loop {
             match coroutine.resume(arg.take()) {
-                FlagsRemoveResult::Ok => return Ok(()),
-                FlagsRemoveResult::WantsFileRead(paths) => {
+                M2dirFlagRemoveResult::Ok => return Ok(()),
+                M2dirFlagRemoveResult::WantsFileRead(paths) => {
                     let files = read_files_tolerant(paths)?;
-                    arg = Some(FlagsRemoveArg::FileRead(files));
+                    arg = Some(M2dirFlagRemoveArg::FileRead(files));
                 }
-                FlagsRemoveResult::WantsFileCreate(files) => {
+                M2dirFlagRemoveResult::WantsFileCreate(files) => {
                     write_files(files)?;
-                    arg = Some(FlagsRemoveArg::FileCreate);
+                    arg = Some(M2dirFlagRemoveArg::FileCreate);
                 }
-                FlagsRemoveResult::WantsFileRemove(paths) => {
+                M2dirFlagRemoveResult::WantsFileRemove(paths) => {
                     remove_files(paths)?;
-                    arg = Some(FlagsRemoveArg::FileRemove);
+                    arg = Some(M2dirFlagRemoveArg::FileRemove);
                 }
-                FlagsRemoveResult::Err(err) => return Err(err.into()),
+                M2dirFlagRemoveResult::Err(err) => return Err(err.into()),
             }
         }
     }
 
-    /// Runs [`FlagsSet`]: replaces entry `id`'s sidecar with `flags`,
-    /// deleting it when `flags` is empty.
+    /// Replaces entry `id`'s flags metadata file with `flags`, deleting it when
+    /// `flags` is empty.
     pub fn set_flags(
         &self,
         m2dir: &M2dir,
         id: impl AsRef<str>,
         flags: Flags,
     ) -> Result<(), M2dirClientError> {
-        let mut coroutine = FlagsSet::new(m2dir, id, flags);
-        let mut arg: Option<FlagsSetArg> = None;
+        let mut coroutine = M2dirFlagSet::new(m2dir, id, flags);
+        let mut arg: Option<M2dirFlagSetArg> = None;
 
         loop {
             match coroutine.resume(arg.take()) {
-                FlagsSetResult::Ok => return Ok(()),
-                FlagsSetResult::WantsFileCreate(files) => {
+                M2dirFlagSetResult::Ok => return Ok(()),
+                M2dirFlagSetResult::WantsFileCreate(files) => {
                     write_files(files)?;
-                    arg = Some(FlagsSetArg::FileCreate);
+                    arg = Some(M2dirFlagSetArg::FileCreate);
                 }
-                FlagsSetResult::WantsFileRemove(paths) => {
+                M2dirFlagSetResult::WantsFileRemove(paths) => {
                     remove_files_tolerant(paths)?;
-                    arg = Some(FlagsSetArg::FileRemove);
+                    arg = Some(M2dirFlagSetArg::FileRemove);
                 }
-                FlagsSetResult::Err(err) => return Err(err.into()),
+                M2dirFlagSetResult::Err(err) => return Err(err.into()),
             }
         }
     }
 }
 
-fn create_dirs(paths: BTreeSet<String>) -> Result<(), io::Error> {
+// ---- Loaders -----------------------------------------------------
+
+fn load_m2store(path: M2dirPath) -> Result<M2store, LoadM2storeError> {
+    if !Path::new(path.as_str()).is_dir() {
+        return Err(LoadM2storeError::NotDir(path));
+    }
+
+    let marker = path.join(DOT_M2STORE);
+    if !Path::new(marker.as_str()).exists() {
+        return Err(LoadM2storeError::NoDotM2store(path));
+    }
+
+    Ok(M2store::from_path(path))
+}
+
+fn load_m2dir(path: M2dirPath) -> Result<M2dir, LoadM2dirError> {
+    if !Path::new(path.as_str()).is_dir() {
+        return Err(LoadM2dirError::NotDir(path));
+    }
+
+    let marker = path.join(DOT_M2DIR);
+    if !Path::new(marker.as_str()).exists() {
+        return Err(LoadM2dirError::NoDotM2dir(path));
+    }
+
+    Ok(M2dir::from_path(path))
+}
+
+// ---- Path normalization -----------------------------------------
+
+fn normalize_path(path: PathBuf) -> M2dirPath {
+    let s = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    let s = s.replace('\\', '/');
+    M2dirPath::new(s)
+}
+
+// ---- Filesystem helpers -----------------------------------------
+
+fn create_dirs(paths: BTreeSet<M2dirPath>) -> Result<(), io::Error> {
     for path in paths {
         trace!("create_dir_all {path}");
-        fs::create_dir_all(&path)?;
+        fs::create_dir_all(path.as_str())?;
     }
     Ok(())
 }
 
-fn remove_dirs(paths: BTreeSet<String>) -> Result<(), io::Error> {
+fn remove_dirs(paths: BTreeSet<M2dirPath>) -> Result<(), io::Error> {
     for path in paths {
         trace!("remove_dir_all {path}");
-        fs::remove_dir_all(&path)?;
+        fs::remove_dir_all(path.as_str())?;
     }
     Ok(())
 }
 
-fn write_files(files: BTreeMap<String, Vec<u8>>) -> Result<(), io::Error> {
+fn write_files(files: BTreeMap<M2dirPath, Vec<u8>>) -> Result<(), io::Error> {
     for (path, contents) in files {
         trace!("write {path} ({} bytes)", contents.len());
 
-        if let Some(parent) = Path::new(&path).parent() {
+        if let Some(parent) = Path::new(path.as_str()).parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, &contents)?;
+        fs::write(path.as_str(), &contents)?;
     }
     Ok(())
 }
 
-fn remove_files(paths: BTreeSet<String>) -> Result<(), io::Error> {
+fn remove_files(paths: BTreeSet<M2dirPath>) -> Result<(), io::Error> {
     for path in paths {
         trace!("remove_file {path}");
-        fs::remove_file(&path)?;
+        fs::remove_file(path.as_str())?;
     }
     Ok(())
 }
 
-fn remove_files_tolerant(paths: BTreeSet<String>) -> Result<(), io::Error> {
+fn remove_files_tolerant(paths: BTreeSet<M2dirPath>) -> Result<(), io::Error> {
     for path in paths {
         trace!("remove_file (tolerant) {path}");
-        match fs::remove_file(&path) {
+        match fs::remove_file(path.as_str()) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
@@ -425,21 +476,24 @@ fn remove_files_tolerant(paths: BTreeSet<String>) -> Result<(), io::Error> {
     Ok(())
 }
 
-fn read_dirs(paths: BTreeSet<String>) -> Result<BTreeMap<String, BTreeSet<String>>, io::Error> {
+fn read_dirs(
+    paths: BTreeSet<M2dirPath>,
+) -> Result<BTreeMap<M2dirPath, BTreeSet<M2dirPath>>, io::Error> {
     let mut entries = BTreeMap::new();
 
     for path in paths {
         trace!("read_dir {path}");
 
         let mut names = BTreeSet::new();
-        match fs::read_dir(&path) {
+        match fs::read_dir(path.as_str()) {
             Ok(iter) => {
                 for entry in iter {
                     let entry = entry?;
-                    names.insert(entry.path().to_string_lossy().into_owned());
+                    names.insert(normalize_path(entry.path()));
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == io::ErrorKind::NotADirectory => {}
             Err(err) => return Err(err),
         }
 
@@ -449,24 +503,26 @@ fn read_dirs(paths: BTreeSet<String>) -> Result<BTreeMap<String, BTreeSet<String
     Ok(entries)
 }
 
-fn read_files(paths: BTreeSet<String>) -> Result<BTreeMap<String, Vec<u8>>, io::Error> {
+fn read_files(paths: BTreeSet<M2dirPath>) -> Result<BTreeMap<M2dirPath, Vec<u8>>, io::Error> {
     let mut contents = BTreeMap::new();
 
     for path in paths {
         trace!("read_file {path}");
-        let bytes = fs::read(&path)?;
+        let bytes = fs::read(path.as_str())?;
         contents.insert(path, bytes);
     }
 
     Ok(contents)
 }
 
-fn read_files_tolerant(paths: BTreeSet<String>) -> Result<BTreeMap<String, Vec<u8>>, io::Error> {
+fn read_files_tolerant(
+    paths: BTreeSet<M2dirPath>,
+) -> Result<BTreeMap<M2dirPath, Vec<u8>>, io::Error> {
     let mut contents = BTreeMap::new();
 
     for path in paths {
         trace!("read_file (tolerant) {path}");
-        match fs::read(&path) {
+        match fs::read(path.as_str()) {
             Ok(bytes) => {
                 contents.insert(path, bytes);
             }
@@ -480,10 +536,197 @@ fn read_files_tolerant(paths: BTreeSet<String>) -> Result<BTreeMap<String, Vec<u
     Ok(contents)
 }
 
-fn rename_paths(pairs: Vec<(String, String)>) -> Result<(), io::Error> {
+fn rename_paths(pairs: Vec<(M2dirPath, M2dirPath)>) -> Result<(), io::Error> {
     for (from, to) in pairs {
         trace!("rename {from} -> {to}");
-        fs::rename(&from, &to)?;
+        fs::rename(from.as_str(), to.as_str())?;
     }
     Ok(())
+}
+
+fn file_exists(paths: BTreeSet<M2dirPath>) -> BTreeMap<M2dirPath, bool> {
+    let mut out = BTreeMap::new();
+    for path in paths {
+        let exists = fs::metadata(path.as_str())
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+        trace!("file_exists {path}: {exists}");
+        out.insert(path, exists);
+    }
+    out
+}
+
+// ---- Entropy ----------------------------------------------------
+
+/// Generates `len` pseudo-random bytes seeded from
+/// [`RandomState`], iterated via xorshift64*.
+fn random_bytes(len: usize) -> Vec<u8> {
+    let mut state = RandomState::new().build_hasher().finish();
+    if state == 0 {
+        state = 0xdeadbeef;
+    }
+
+    let mut out = Vec::with_capacity(len);
+    let mut buf = 0u64;
+    let mut i = 8;
+
+    while out.len() < len {
+        if i == 8 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            buf = state;
+            i = 0;
+        }
+        out.push(buf as u8);
+        buf >>= 8;
+        i += 1;
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use tempfile::tempdir;
+
+    use crate::client::*;
+
+    fn client() -> (tempfile::TempDir, M2dirClient) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let client = M2dirClient::new(root);
+        client.init_store().unwrap();
+        (dir, client)
+    }
+
+    #[test]
+    fn init_store_writes_marker() {
+        let (dir, _client) = client();
+        assert!(dir.path().join(DOT_M2STORE).exists());
+    }
+
+    #[test]
+    fn create_mailbox_writes_dot_m2dir() {
+        let (_dir, client) = client();
+
+        let inbox = client.create_mailbox("inbox").unwrap();
+        assert!(Path::new(inbox.path().as_str()).is_dir());
+        assert!(Path::new(inbox.marker_path().as_str()).exists());
+        assert!(Path::new(inbox.meta_dir().as_str()).is_dir());
+    }
+
+    #[test]
+    fn list_mailboxes_finds_created_folder() {
+        let (_dir, client) = client();
+
+        client.create_mailbox("inbox").unwrap();
+        client.create_mailbox("sent").unwrap();
+
+        let mailboxes = client.list_mailboxes().unwrap();
+        assert_eq!(mailboxes.len(), 2);
+    }
+
+    #[test]
+    fn store_and_list_messages_round_trip() {
+        let (_dir, client) = client();
+
+        let inbox = client.create_mailbox("inbox").unwrap();
+        let msg = b"From: alice@example.org\r\nDate: Tue, 15 Apr 1994 08:12:31 GMT\r\nSubject: hi\r\n\r\nbody\r\n";
+
+        let entry = client.store(inbox.clone(), msg.to_vec()).unwrap();
+        assert!(Path::new(entry.path().as_str()).is_file());
+
+        let listed = client.list_messages(inbox.clone()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id(), entry.id());
+
+        let (fetched, contents) = client.get(inbox, entry.id()).unwrap();
+        assert_eq!(fetched.id(), entry.id());
+        assert_eq!(contents, msg);
+    }
+
+    #[test]
+    fn flags_round_trip_via_meta() {
+        let (_dir, client) = client();
+
+        let inbox = client.create_mailbox("inbox").unwrap();
+        let msg = b"From: a\r\n\r\nbody\r\n";
+        let entry = client.store(inbox.clone(), msg.to_vec()).unwrap();
+
+        let initial = client.read_flags(&inbox, entry.id()).unwrap();
+        assert_eq!(initial.len(), 0);
+
+        let mut to_add = crate::flag::Flags::default();
+        to_add.insert("$seen");
+        to_add.insert("$forwarded");
+        client.add_flags(&inbox, entry.id(), to_add).unwrap();
+
+        let after_add = client.read_flags(&inbox, entry.id()).unwrap();
+        assert_eq!(after_add.len(), 2);
+        assert!(after_add.contains("$seen"));
+        assert!(after_add.contains("$forwarded"));
+
+        let mut to_remove = crate::flag::Flags::default();
+        to_remove.insert("$seen");
+        client.remove_flags(&inbox, entry.id(), to_remove).unwrap();
+
+        let after_remove = client.read_flags(&inbox, entry.id()).unwrap();
+        assert_eq!(after_remove.len(), 1);
+        assert!(after_remove.contains("$forwarded"));
+
+        let mut replacement = crate::flag::Flags::default();
+        replacement.insert("custom");
+        replacement.insert("$junk");
+        client.set_flags(&inbox, entry.id(), replacement).unwrap();
+
+        let after_set = client.read_flags(&inbox, entry.id()).unwrap();
+        assert_eq!(after_set.len(), 2);
+        assert!(after_set.contains("custom"));
+        assert!(after_set.contains("$junk"));
+
+        client
+            .set_flags(&inbox, entry.id(), crate::flag::Flags::default())
+            .unwrap();
+        let after_clear = client.read_flags(&inbox, entry.id()).unwrap();
+        assert!(after_clear.is_empty());
+        assert!(!Path::new(inbox.flags_path(entry.id()).as_str()).exists());
+    }
+
+    #[test]
+    fn delete_message_removes_file_and_flags_meta() {
+        let (_dir, client) = client();
+
+        let inbox = client.create_mailbox("inbox").unwrap();
+        let entry = client.store(inbox.clone(), b"hello".to_vec()).unwrap();
+
+        let mut flags = crate::flag::Flags::default();
+        flags.insert("$seen");
+        client.add_flags(&inbox, entry.id(), flags).unwrap();
+        assert!(Path::new(inbox.flags_path(entry.id()).as_str()).exists());
+
+        client.delete_message(inbox.clone(), entry.id()).unwrap();
+        assert!(!Path::new(entry.path().as_str()).exists());
+        assert!(!Path::new(inbox.flags_path(entry.id()).as_str()).exists());
+
+        let listed = client.list_messages(inbox).unwrap();
+        assert!(listed.is_empty());
+    }
+
+    #[test]
+    fn delete_mailbox_removes_tree() {
+        let (_dir, client) = client();
+
+        let inbox = client.create_mailbox("inbox").unwrap();
+        let path = inbox.path().clone();
+        assert!(Path::new(path.as_str()).is_dir());
+
+        client.delete_mailbox(path.clone()).unwrap();
+        assert!(!Path::new(path.as_str()).exists());
+    }
+
+    /// Bring the marker constant into scope for tests.
+    use crate::m2store::DOT_M2STORE;
 }

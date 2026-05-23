@@ -2,14 +2,14 @@
 
 use core::hash::{Hash, Hasher};
 
-use alloc::{string::String, vec::Vec};
-use std::path::{Path, PathBuf};
+use alloc::{
+    format,
+    string::{String, ToString},
+};
 
 use thiserror::Error;
 
-use crate::base64;
-use crate::entry::write_checksum;
-use crate::parse::extract_date;
+use crate::{base64, entry::write_checksum, parse::extract_date, path::M2dirPath};
 
 /// Marker filename written into every m2dir.
 pub const DOT_M2DIR: &str = ".m2dir";
@@ -22,61 +22,58 @@ pub const META: &str = ".meta";
 pub enum LoadM2dirError {
     /// The given path is not a directory.
     #[error("path {0} is not a directory")]
-    NotDir(PathBuf),
+    NotDir(M2dirPath),
 
     /// The given directory does not contain the `.m2dir` marker.
     #[error("no valid `.m2dir` marker found in directory {0}")]
-    NoDotM2dir(PathBuf),
+    NoDotM2dir(M2dirPath),
 }
 
 /// A single m2dir directory on the filesystem.
 ///
 /// Holds the root path and provides helpers to derive entry paths,
 /// metadata paths, and a new filename for a delivery.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct M2dir {
-    path: PathBuf,
+    path: M2dirPath,
 }
 
 impl M2dir {
     /// Builds an [`M2dir`] from a path without checking the marker.
-    ///
-    /// Prefer [`TryFrom<PathBuf>`] for opening existing m2dirs.
-    pub fn from_path(path: impl Into<PathBuf>) -> Self {
+    pub fn from_path(path: impl Into<M2dirPath>) -> Self {
         Self { path: path.into() }
     }
 
     /// Returns the path to the m2dir directory.
-    pub fn path(&self) -> &Path {
+    pub fn path(&self) -> &M2dirPath {
         &self.path
     }
 
     /// Returns the path to the `.m2dir` marker file.
-    pub fn marker_path(&self) -> PathBuf {
+    pub fn marker_path(&self) -> M2dirPath {
         self.path.join(DOT_M2DIR)
     }
 
     /// Returns the path to the `.meta` directory.
-    pub fn meta_dir(&self) -> PathBuf {
+    pub fn meta_dir(&self) -> M2dirPath {
         self.path.join(META)
     }
 
-    /// Returns the path to the `.flags` sidecar for the given entry
-    /// id.
-    pub fn flags_sidecar_path(&self, id: &str) -> PathBuf {
-        self.meta_dir().join(format!("{id}.flags"))
+    /// Returns the path to the `.flags` metadata file for the given
+    /// entry id.
+    pub fn flags_path(&self, id: &str) -> M2dirPath {
+        self.meta_dir().join(&format!("{id}.flags"))
     }
 
     /// Computes the filename and final on-disk path for a new entry
-    /// holding `bytes`. The filename is `<date>,<checksum>.<nonce>` per
-    /// the m2dir specification.
+    /// holding `bytes`. The filename is `<date>,<checksum>.<nonce>`
+    /// per the m2dir specification.
     ///
-    /// The `nonce_bytes` argument should be 4 freshly-generated random
-    /// bytes (from [`crate::rand::random_bytes`]).
-    pub fn entry_path(&self, bytes: &[u8], nonce_bytes: &[u8]) -> (String, PathBuf) {
+    /// `nonce_bytes` should be 4 freshly-generated random bytes
+    /// supplied by the caller.
+    pub fn entry_path(&self, bytes: &[u8], nonce_bytes: &[u8]) -> (String, M2dirPath) {
         let mut checksum = String::new();
-        write_checksum(bytes, &mut checksum)
-            .expect("base64 encoding to a string is always valid");
+        write_checksum(bytes, &mut checksum).expect("base64 encoding to a string is always valid");
 
         let dt = core::str::from_utf8(bytes)
             .ok()
@@ -87,8 +84,8 @@ impl M2dir {
         base64::encode(nonce_bytes, &mut nonce)
             .expect("base64 encoding to a string is always valid");
 
-        let id = checksum.clone();
-        let filename = format!("{dt},{checksum}.{nonce}");
+        let id = format!("{checksum}.{nonce}");
+        let filename = format!("{dt},{id}");
         let path = self.path.join(&filename);
 
         (id, path)
@@ -96,9 +93,8 @@ impl M2dir {
 
     /// Returns the path of a temporary file inside this m2dir, used
     /// during the write-then-rename delivery sequence.
-    pub fn tmp_path(&self, pid: u32, counter: u32) -> PathBuf {
-        self.path
-            .join(format!(".m2dir.tmp.{pid:x}{counter:x}"))
+    pub fn tmp_path(&self, pid: u32, counter: u32) -> M2dirPath {
+        self.path.join(&format!(".m2dir.tmp.{pid:x}{counter:x}"))
     }
 
     /// Splits a filename into its `<checksum>.<nonce>` tail (used as
@@ -106,12 +102,6 @@ impl M2dir {
     pub fn parse_filename_id(filename: &str) -> Option<&str> {
         let (_, id) = filename.rsplit_once(',')?;
         Some(id)
-    }
-
-    /// Extracts the checksum portion of an entry id (the chunk before
-    /// the first `.`).
-    pub fn id_checksum(id: &str) -> &str {
-        id.rsplit_once('.').map(|(c, _)| c).unwrap_or(id)
     }
 }
 
@@ -121,54 +111,34 @@ impl Hash for M2dir {
     }
 }
 
-impl AsRef<Path> for M2dir {
-    fn as_ref(&self) -> &Path {
-        self.path.as_ref()
+impl AsRef<M2dirPath> for M2dir {
+    fn as_ref(&self) -> &M2dirPath {
+        &self.path
     }
 }
 
-impl TryFrom<PathBuf> for M2dir {
-    type Error = LoadM2dirError;
-
-    fn try_from(path: PathBuf) -> Result<Self, Self::Error> {
-        if !path.is_dir() {
-            return Err(LoadM2dirError::NotDir(path));
-        }
-
-        let marker = path.join(DOT_M2DIR);
-        if !marker.exists() {
-            return Err(LoadM2dirError::NoDotM2dir(path));
-        }
-
-        Ok(Self { path })
+impl AsRef<str> for M2dir {
+    fn as_ref(&self) -> &str {
+        self.path.as_str()
     }
 }
 
-impl TryFrom<&Path> for M2dir {
-    type Error = LoadM2dirError;
-
-    fn try_from(path: &Path) -> Result<Self, Self::Error> {
-        path.to_path_buf().try_into()
+impl From<M2dirPath> for M2dir {
+    fn from(path: M2dirPath) -> Self {
+        Self { path }
     }
 }
 
-/// Splits a list of filenames into `(visible_files, dotfiles)`. Used
-/// by coroutine modules that read `.meta` to filter siblings.
-pub fn partition_dotfiles(paths: Vec<String>) -> (Vec<String>, Vec<String>) {
-    let mut visible = Vec::new();
-    let mut hidden = Vec::new();
+impl From<String> for M2dir {
+    fn from(path: String) -> Self {
+        Self { path: path.into() }
+    }
+}
 
-    for path in paths {
-        if path
-            .rsplit('/')
-            .next()
-            .is_some_and(|name| name.starts_with('.'))
-        {
-            hidden.push(path);
-        } else {
-            visible.push(path);
+impl From<&str> for M2dir {
+    fn from(path: &str) -> Self {
+        Self {
+            path: path.to_string().into(),
         }
     }
-
-    (visible, hidden)
 }

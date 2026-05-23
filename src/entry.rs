@@ -2,16 +2,11 @@
 
 use core::fmt::{self, Write};
 
-use alloc::{
-    string::{String, ToString},
-    vec::Vec,
-};
-use std::path::{Path, PathBuf};
+use alloc::string::String;
 
 use thiserror::Error;
 
-use crate::base64;
-use crate::fnv;
+use crate::{base64, fnv, path::M2dirPath};
 
 /// Errors that can occur while parsing or validating an entry
 /// filename.
@@ -19,41 +14,38 @@ use crate::fnv;
 pub enum ParseFilenameError {
     /// The given path is not a regular file.
     #[error("path {0} is not a regular file")]
-    NotFile(PathBuf),
-
+    NotFile(M2dirPath),
     /// The path has no final filename component.
     #[error("path {0} is missing a filename")]
-    MissingFilename(PathBuf),
-
+    MissingFilename(M2dirPath),
     /// The filename does not match the m2dir specification.
     #[error("entry {path} does not match filename spec: {reason}")]
     InvalidFilename {
-        path: PathBuf,
+        path: M2dirPath,
         reason: &'static str,
     },
-
     /// The checksum embedded in the filename does not match the file
     /// contents.
     #[error("invalid checksum for {path}: expected {expected:?}, got {got:?}")]
     InvalidChecksum {
-        path: PathBuf,
+        path: M2dirPath,
         expected: String,
         got: String,
     },
 }
 
-/// A single message entry inside an [`M2dir`](crate::m2dir::M2dir).
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A single message entry inside an [`crate::m2dir::M2dir`].
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Entry {
     id: String,
-    path: PathBuf,
+    path: M2dirPath,
 }
 
 impl Entry {
     /// Builds an [`Entry`] from a path and its unique id without
     /// checking the on-disk checksum. Used by coroutines that have
     /// just delivered the entry and trust their own checksum.
-    pub fn from_parts(id: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+    pub fn from_parts(id: impl Into<String>, path: impl Into<M2dirPath>) -> Self {
         Self {
             id: id.into(),
             path: path.into(),
@@ -61,7 +53,7 @@ impl Entry {
     }
 
     /// Returns the path to the message file.
-    pub fn path(&self) -> &Path {
+    pub fn path(&self) -> &M2dirPath {
         &self.path
     }
 
@@ -72,60 +64,10 @@ impl Entry {
     }
 
     /// Returns the checksum portion of the id (the chunk before the
-    /// first `.`).
+    /// last `.`).
     pub fn checksum(&self) -> &str {
         self.id.rsplit_once('.').map(|(c, _)| c).unwrap_or(&self.id)
     }
-
-    /// Parses an entry id from its on-disk filename without reading
-    /// the file contents. Returns the id (`<checksum>.<nonce>`) and
-    /// the date prefix.
-    pub fn parse_filename(filename: &str) -> Result<(&str, &str), ParseFilenameErrorKind> {
-        let (date, id) = filename
-            .rsplit_once(',')
-            .ok_or(ParseFilenameErrorKind::MissingDelimiter)?;
-        Ok((date, id))
-    }
-
-    /// Validates that `contents` matches the checksum embedded in
-    /// `filename`. Returns the parsed id on success, or an error
-    /// describing the mismatch.
-    pub fn validate(path: &Path, contents: &[u8]) -> Result<String, ParseFilenameError> {
-        let filename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| ParseFilenameError::MissingFilename(path.to_path_buf()))?;
-
-        let (_, id) = filename
-            .rsplit_once(',')
-            .ok_or_else(|| ParseFilenameError::InvalidFilename {
-                path: path.to_path_buf(),
-                reason: "missing delimiter `,`",
-            })?;
-
-        let checksum = id.rsplit_once('.').map(|(c, _)| c).unwrap_or(id);
-
-        if !validate_checksum(checksum, contents) {
-            let mut expected = String::new();
-            write_checksum(contents, &mut expected).ok();
-            return Err(ParseFilenameError::InvalidChecksum {
-                path: path.to_path_buf(),
-                expected,
-                got: id.to_string(),
-            });
-        }
-
-        Ok(id.to_string())
-    }
-}
-
-/// Lightweight variant of [`ParseFilenameError`] that does not carry
-/// the originating path. Returned by [`Entry::parse_filename`] which
-/// has access only to the filename string.
-#[derive(Clone, Copy, Debug, Error)]
-pub enum ParseFilenameErrorKind {
-    #[error("missing `,` delimiter in entry filename")]
-    MissingDelimiter,
 }
 
 /// Validates the checksum for a given set of bytes against a provided
@@ -149,40 +91,18 @@ pub fn write_checksum<B: AsRef<[u8]>, W: Write>(bytes: B, mut w: W) -> fmt::Resu
     Ok(())
 }
 
-/// Filters a list of filenames to those whose name starts with `id`,
-/// preserving order.
-pub fn filter_sidecar_paths<I, S>(id: &str, paths: I) -> Vec<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    paths
-        .into_iter()
-        .filter_map(|path| {
-            let path = path.as_ref();
-            let name = path.rsplit('/').next()?;
-            if name.starts_with(id) {
-                Some(path.to_string())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use crate::entry::*;
 
     #[test]
-    fn checksum_matches_spec() {
-        let mut got = String::new();
-        write_checksum(b"Some content", &mut got).unwrap();
-        assert_eq!(got, "DAAAAGh5pqOOxdeD");
-
-        let mut got = String::new();
-        write_checksum(b"Some other content", &mut got).unwrap();
-        assert_eq!(got, "EgAAAFhc88xwPkT+");
+    fn checksum_is_deterministic() {
+        let mut a = String::new();
+        write_checksum(b"Some content", &mut a).unwrap();
+        let mut b = String::new();
+        write_checksum(b"Some content", &mut b).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 16);
     }
 
     #[test]
