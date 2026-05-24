@@ -522,7 +522,7 @@ fn load_m2dir(path: M2dirPath) -> Result<M2dir, LoadM2dirError> {
 fn normalize_path(path: PathBuf) -> M2dirPath {
     let s = path.to_string_lossy().into_owned();
     #[cfg(windows)]
-    let s = s.replace('\\', '/');
+    let s = s.replace('\\', "/");
     M2dirPath::new(s)
 }
 
