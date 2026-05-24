@@ -11,7 +11,7 @@ use alloc::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{flag::Flags, m2dir::M2dir, path::M2dirPath};
+use crate::{flag::M2dirFlags, m2dir::M2dir, path::M2dirPath};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -61,14 +61,14 @@ pub enum M2dirFlagAddArg {
 #[derive(Debug)]
 pub struct M2dirFlagAdd {
     flags_path: M2dirPath,
-    flags: Flags,
+    flags: M2dirFlags,
     state: State,
 }
 
 impl M2dirFlagAdd {
     /// Creates a new coroutine that will add `flags` to the flags
     /// metadata file for entry `id` inside `m2dir`.
-    pub fn new(m2dir: &M2dir, id: impl AsRef<str>, flags: Flags) -> Self {
+    pub fn new(m2dir: &M2dir, id: impl AsRef<str>, flags: M2dirFlags) -> Self {
         let flags_path = m2dir.flags_path(id.as_ref());
 
         Self {
@@ -92,7 +92,7 @@ impl M2dirFlagAdd {
                 let bytes = contents.into_values().next().unwrap_or_default();
                 let existing = core::str::from_utf8(&bytes).unwrap_or("");
 
-                let mut merged = Flags::from_meta(existing);
+                let mut merged = M2dirFlags::from_meta(existing);
                 merged.extend(self.flags.clone());
 
                 trace!(

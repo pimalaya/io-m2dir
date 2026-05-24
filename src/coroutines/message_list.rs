@@ -11,7 +11,7 @@ use alloc::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{entry::Entry, m2dir::M2dir, path::M2dirPath};
+use crate::{entry::M2dirEntry, m2dir::M2dir, path::M2dirPath};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -24,7 +24,7 @@ pub enum M2dirMessageListError {
 #[derive(Clone, Debug)]
 pub enum M2dirMessageListResult {
     /// The coroutine has successfully terminated its progression.
-    Ok(Vec<Entry>),
+    Ok(Vec<M2dirEntry>),
     /// The caller must read the entries of the given directories
     /// and feed back [`M2dirMessageListArg::DirRead`].
     WantsDirRead(BTreeSet<M2dirPath>),
@@ -129,7 +129,7 @@ impl M2dirMessageList {
 
                 for (path, id) in candidates {
                     if probes.get(&path).copied().unwrap_or(false) {
-                        found.push(Entry::from_parts(id, path));
+                        found.push(M2dirEntry::from_parts(id, path));
                     }
                 }
 

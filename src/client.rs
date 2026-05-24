@@ -16,7 +16,7 @@ use std::{
     hash::{BuildHasher, Hasher},
     io,
     path::{Path, PathBuf},
-    process,
+    process, thread,
 };
 
 use log::trace;
@@ -27,8 +27,8 @@ use crate::{
         flag_add::*, flag_remove::*, flag_set::*, mailbox_create::*, mailbox_delete::*,
         mailbox_list::*, message_delete::*, message_get::*, message_list::*, message_store::*,
     },
-    entry::Entry,
-    flag::Flags,
+    entry::{M2dirEntry, M2dirFullEntry, ParseFilenameError, validate_checksum},
+    flag::M2dirFlags,
     m2dir::{DOT_M2DIR, LoadM2dirError, M2dir},
     m2store::{DOT_M2STORE, LoadM2storeError, M2store, NewFolderError},
     path::M2dirPath,
@@ -63,6 +63,8 @@ pub enum M2dirClientError {
     RemoveFlags(#[from] M2dirFlagRemoveError),
     #[error(transparent)]
     SetFlags(#[from] M2dirFlagSetError),
+    #[error(transparent)]
+    Parse(#[from] ParseFilenameError),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -182,7 +184,7 @@ impl M2dirClient {
     // ---- Messages -----------------------------------------------
 
     /// Lists every entry inside `m2dir`.
-    pub fn list_messages(&self, m2dir: M2dir) -> Result<Vec<Entry>, M2dirClientError> {
+    pub fn list_entries(&self, m2dir: M2dir) -> Result<Vec<M2dirEntry>, M2dirClientError> {
         let mut coroutine = M2dirMessageList::new(m2dir);
         let mut arg: Option<M2dirMessageListArg> = None;
 
@@ -202,13 +204,111 @@ impl M2dirClient {
         }
     }
 
+    /// Reads the file backing `entry` and validates its checksum.
+    ///
+    /// Prefer this over [`Self::get`] when the entry is already known:
+    /// skips the directory scan used to resolve an id.
+    pub fn read_entry(&self, entry: &M2dirEntry) -> Result<Vec<u8>, M2dirClientError> {
+        let path = entry.path();
+        trace!("read entry at {path}");
+
+        let bytes = fs::read(path.as_str())?;
+        let checksum = entry.checksum();
+
+        if !validate_checksum(checksum, &bytes) {
+            return Err(ParseFilenameError::InvalidChecksum {
+                path: path.clone(),
+                expected: checksum.to_string(),
+                got: entry.id().to_string(),
+            }
+            .into());
+        }
+
+        Ok(bytes)
+    }
+
+    /// Reads the bytes and flags of every entry sequentially.
+    ///
+    /// Returns an unordered set: callers that need a specific order
+    /// must sort the collected entries themselves. Use
+    /// [`Self::read_entries_par`] for the parallel variant.
+    pub fn read_entries(
+        &self,
+        m2dir: &M2dir,
+        entries: &[M2dirEntry],
+    ) -> Result<BTreeSet<M2dirFullEntry>, M2dirClientError> {
+        entries
+            .iter()
+            .map(|entry| self.read_full_entry(m2dir, entry))
+            .collect()
+    }
+
+    /// Parallel variant of [`Self::read_entries`] backed by a
+    /// `std::thread::scope` worker pool sized to
+    /// [`thread::available_parallelism`].
+    pub fn read_entries_par(
+        &self,
+        m2dir: &M2dir,
+        entries: &[M2dirEntry],
+    ) -> Result<BTreeSet<M2dirFullEntry>, M2dirClientError> {
+        if entries.len() <= 1 {
+            return entries
+                .iter()
+                .map(|entry| self.read_full_entry(m2dir, entry))
+                .collect();
+        }
+
+        let n_threads = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+            .min(entries.len());
+
+        let chunk_size = entries.len().div_ceil(n_threads);
+
+        thread::scope(|s| -> Result<BTreeSet<M2dirFullEntry>, M2dirClientError> {
+            let mut handles = Vec::with_capacity(n_threads);
+
+            for chunk in entries.chunks(chunk_size) {
+                let this = self;
+
+                handles.push(s.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|entry| this.read_full_entry(m2dir, entry))
+                        .collect::<Result<Vec<_>, _>>()
+                }));
+            }
+
+            let mut out = BTreeSet::new();
+
+            for handle in handles {
+                for full in handle.join().expect("m2dir worker thread panicked")? {
+                    out.insert(full);
+                }
+            }
+
+            Ok(out)
+        })
+    }
+
+    fn read_full_entry(
+        &self,
+        m2dir: &M2dir,
+        entry: &M2dirEntry,
+    ) -> Result<M2dirFullEntry, M2dirClientError> {
+        let contents = self.read_entry(entry)?;
+        let flags = self.read_flags(m2dir, entry.id())?;
+
+        Ok(M2dirFullEntry::from_parts(entry.clone(), contents, flags))
+    }
+
     /// Locates and reads entry `id` from `m2dir`, validating the
     /// checksum embedded in the filename.
     pub fn get(
         &self,
         m2dir: M2dir,
         id: impl ToString,
-    ) -> Result<(Entry, Vec<u8>), M2dirClientError> {
+    ) -> Result<(M2dirEntry, Vec<u8>), M2dirClientError> {
         let mut coroutine = M2dirMessageGet::new(m2dir, id);
         let mut arg: Option<M2dirMessageGetArg> = None;
 
@@ -234,7 +334,7 @@ impl M2dirClient {
 
     /// Writes `bytes` to a temporary file inside `m2dir`, then
     /// atomically renames it to its checksum-based final filename.
-    pub fn store(&self, m2dir: M2dir, bytes: Vec<u8>) -> Result<Entry, M2dirClientError> {
+    pub fn store(&self, m2dir: M2dir, bytes: Vec<u8>) -> Result<M2dirEntry, M2dirClientError> {
         let mut coroutine = M2dirMessageStore::new(m2dir, bytes);
         let mut arg: Option<M2dirMessageStoreArg> = None;
 
@@ -293,13 +393,13 @@ impl M2dirClient {
         &self,
         m2dir: &M2dir,
         id: impl AsRef<str>,
-    ) -> Result<Flags, M2dirClientError> {
+    ) -> Result<M2dirFlags, M2dirClientError> {
         let path = m2dir.flags_path(id.as_ref());
         trace!("read flags at {path}");
 
         match fs::read_to_string(path.as_str()) {
-            Ok(text) => Ok(Flags::from_meta(&text)),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Flags::default()),
+            Ok(text) => Ok(M2dirFlags::from_meta(&text)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(M2dirFlags::default()),
             Err(err) => Err(err.into()),
         }
     }
@@ -309,7 +409,7 @@ impl M2dirClient {
         &self,
         m2dir: &M2dir,
         id: impl AsRef<str>,
-        flags: Flags,
+        flags: M2dirFlags,
     ) -> Result<(), M2dirClientError> {
         let mut coroutine = M2dirFlagAdd::new(m2dir, id, flags);
         let mut arg: Option<M2dirFlagAddArg> = None;
@@ -336,7 +436,7 @@ impl M2dirClient {
         &self,
         m2dir: &M2dir,
         id: impl AsRef<str>,
-        flags: Flags,
+        flags: M2dirFlags,
     ) -> Result<(), M2dirClientError> {
         let mut coroutine = M2dirFlagRemove::new(m2dir, id, flags);
         let mut arg: Option<M2dirFlagRemoveArg> = None;
@@ -367,7 +467,7 @@ impl M2dirClient {
         &self,
         m2dir: &M2dir,
         id: impl AsRef<str>,
-        flags: Flags,
+        flags: M2dirFlags,
     ) -> Result<(), M2dirClientError> {
         let mut coroutine = M2dirFlagSet::new(m2dir, id, flags);
         let mut arg: Option<M2dirFlagSetArg> = None;
@@ -630,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn store_and_list_messages_round_trip() {
+    fn store_and_list_entries_round_trip() {
         let (_dir, client) = client();
 
         let inbox = client.create_mailbox("inbox").unwrap();
@@ -639,7 +739,7 @@ mod tests {
         let entry = client.store(inbox.clone(), msg.to_vec()).unwrap();
         assert!(Path::new(entry.path().as_str()).is_file());
 
-        let listed = client.list_messages(inbox.clone()).unwrap();
+        let listed = client.list_entries(inbox.clone()).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id(), entry.id());
 
@@ -659,7 +759,7 @@ mod tests {
         let initial = client.read_flags(&inbox, entry.id()).unwrap();
         assert_eq!(initial.len(), 0);
 
-        let mut to_add = crate::flag::Flags::default();
+        let mut to_add = crate::flag::M2dirFlags::default();
         to_add.insert("$seen");
         to_add.insert("$forwarded");
         client.add_flags(&inbox, entry.id(), to_add).unwrap();
@@ -669,7 +769,7 @@ mod tests {
         assert!(after_add.contains("$seen"));
         assert!(after_add.contains("$forwarded"));
 
-        let mut to_remove = crate::flag::Flags::default();
+        let mut to_remove = crate::flag::M2dirFlags::default();
         to_remove.insert("$seen");
         client.remove_flags(&inbox, entry.id(), to_remove).unwrap();
 
@@ -677,7 +777,7 @@ mod tests {
         assert_eq!(after_remove.len(), 1);
         assert!(after_remove.contains("$forwarded"));
 
-        let mut replacement = crate::flag::Flags::default();
+        let mut replacement = crate::flag::M2dirFlags::default();
         replacement.insert("custom");
         replacement.insert("$junk");
         client.set_flags(&inbox, entry.id(), replacement).unwrap();
@@ -688,7 +788,7 @@ mod tests {
         assert!(after_set.contains("$junk"));
 
         client
-            .set_flags(&inbox, entry.id(), crate::flag::Flags::default())
+            .set_flags(&inbox, entry.id(), crate::flag::M2dirFlags::default())
             .unwrap();
         let after_clear = client.read_flags(&inbox, entry.id()).unwrap();
         assert!(after_clear.is_empty());
@@ -702,7 +802,7 @@ mod tests {
         let inbox = client.create_mailbox("inbox").unwrap();
         let entry = client.store(inbox.clone(), b"hello".to_vec()).unwrap();
 
-        let mut flags = crate::flag::Flags::default();
+        let mut flags = crate::flag::M2dirFlags::default();
         flags.insert("$seen");
         client.add_flags(&inbox, entry.id(), flags).unwrap();
         assert!(Path::new(inbox.flags_path(entry.id()).as_str()).exists());
@@ -711,7 +811,7 @@ mod tests {
         assert!(!Path::new(entry.path().as_str()).exists());
         assert!(!Path::new(inbox.flags_path(entry.id()).as_str()).exists());
 
-        let listed = client.list_messages(inbox).unwrap();
+        let listed = client.list_entries(inbox).unwrap();
         assert!(listed.is_empty());
     }
 

@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::{
     coroutines::message_list::*,
-    entry::{Entry, ParseFilenameError, validate_checksum},
+    entry::{M2dirEntry, ParseFilenameError, validate_checksum},
     m2dir::M2dir,
     path::M2dirPath,
 };
@@ -35,7 +35,10 @@ pub enum M2dirMessageGetError {
 #[derive(Clone, Debug)]
 pub enum M2dirMessageGetResult {
     /// The coroutine has successfully terminated its progression.
-    Ok { entry: Entry, contents: Vec<u8> },
+    Ok {
+        entry: M2dirEntry,
+        contents: Vec<u8>,
+    },
     /// The caller must read the entries of the given directories
     /// and feed back [`M2dirMessageGetArg::DirRead`].
     WantsDirRead(BTreeSet<M2dirPath>),
@@ -54,7 +57,7 @@ pub enum M2dirMessageGetResult {
 #[derive(Clone, Debug, Default)]
 pub enum State {
     List(M2dirMessageList),
-    Read(Entry),
+    Read(M2dirEntry),
     #[default]
     Invalid,
 }

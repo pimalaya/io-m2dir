@@ -12,10 +12,10 @@ use alloc::{
 ///
 /// Each flag is an arbitrary UTF-8 string; serialization to the
 /// `.meta/<id>.flags` metadata file is one flag per line.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Flags(BTreeSet<String>);
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct M2dirFlags(BTreeSet<String>);
 
-impl Flags {
+impl M2dirFlags {
     /// Returns an iterator over the flags in this set.
     pub fn iter(&self) -> impl Iterator<Item = &str> {
         self.0.iter().map(String::as_str)
@@ -48,12 +48,12 @@ impl Flags {
     }
 
     /// Adds every flag from `flags` to this set.
-    pub fn extend(&mut self, flags: Flags) {
+    pub fn extend(&mut self, flags: M2dirFlags) {
         self.0.extend(flags.0);
     }
 
     /// Removes every flag in `flags` from this set.
-    pub fn difference(&mut self, flags: &Flags) {
+    pub fn difference(&mut self, flags: &M2dirFlags) {
         self.0 = self.0.difference(&flags.0).cloned().collect();
     }
 
@@ -81,33 +81,33 @@ impl Flags {
     }
 }
 
-impl fmt::Display for Flags {
+impl fmt::Display for M2dirFlags {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let sorted: Vec<&str> = self.0.iter().map(String::as_str).collect();
         write!(f, "{}", sorted.join(","))
     }
 }
 
-impl FromIterator<String> for Flags {
+impl FromIterator<String> for M2dirFlags {
     fn from_iter<I: IntoIterator<Item = String>>(iter: I) -> Self {
         Self(iter.into_iter().collect())
     }
 }
 
-impl<'a> FromIterator<&'a str> for Flags {
+impl<'a> FromIterator<&'a str> for M2dirFlags {
     fn from_iter<I: IntoIterator<Item = &'a str>>(iter: I) -> Self {
         Self(iter.into_iter().map(ToString::to_string).collect())
     }
 }
 
-impl From<BTreeSet<String>> for Flags {
+impl From<BTreeSet<String>> for M2dirFlags {
     fn from(set: BTreeSet<String>) -> Self {
         Self(set)
     }
 }
 
-impl From<Flags> for BTreeSet<String> {
-    fn from(flags: Flags) -> Self {
+impl From<M2dirFlags> for BTreeSet<String> {
+    fn from(flags: M2dirFlags) -> Self {
         flags.0
     }
 }
@@ -118,13 +118,13 @@ mod tests {
 
     #[test]
     fn meta_round_trip() {
-        let mut flags = Flags::default();
+        let mut flags = M2dirFlags::default();
         flags.insert("$seen");
         flags.insert("$forwarded");
         flags.insert("custom");
 
         let serialized = flags.to_meta();
-        let parsed = Flags::from_meta(&serialized);
+        let parsed = M2dirFlags::from_meta(&serialized);
 
         assert_eq!(parsed.len(), 3);
         assert!(parsed.contains("$seen"));
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn meta_is_sorted() {
-        let mut flags = Flags::default();
+        let mut flags = M2dirFlags::default();
         flags.insert("zeta");
         flags.insert("alpha");
         flags.insert("middle");
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn from_meta_ignores_blanks() {
-        let parsed = Flags::from_meta("$seen\n\n\n$forwarded\n");
+        let parsed = M2dirFlags::from_meta("$seen\n\n\n$forwarded\n");
         assert_eq!(parsed.len(), 2);
         assert!(parsed.contains("$seen"));
         assert!(parsed.contains("$forwarded"));

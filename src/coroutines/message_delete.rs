@@ -12,7 +12,7 @@ use alloc::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{coroutines::message_list::*, entry::Entry, m2dir::M2dir, path::M2dirPath};
+use crate::{coroutines::message_list::*, entry::M2dirEntry, m2dir::M2dir, path::M2dirPath};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -48,7 +48,7 @@ pub enum M2dirMessageDeleteResult {
 #[derive(Clone, Debug, Default)]
 pub enum State {
     List(M2dirMessageList),
-    ReadMeta(Entry),
+    ReadMeta(M2dirEntry),
     Removing,
     #[default]
     Invalid,

@@ -10,7 +10,7 @@ use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use log::trace;
 use thiserror::Error;
 
-use crate::entry::Entry;
+use crate::entry::M2dirEntry;
 use crate::m2dir::M2dir;
 use crate::path::M2dirPath;
 
@@ -29,7 +29,7 @@ pub enum M2dirMessageStoreError {
 #[derive(Clone, Debug)]
 pub enum M2dirMessageStoreResult {
     /// The coroutine has successfully terminated its progression.
-    Ok(Entry),
+    Ok(M2dirEntry),
     /// The caller must provide the current process id and feed back
     /// [`M2dirMessageStoreArg::Pid`].
     WantsPid,
@@ -150,7 +150,7 @@ impl M2dirMessageStore {
             (State::Renamed { final_path, id }, Some(M2dirMessageStoreArg::Rename)) => {
                 trace!("renamed tmp file to {final_path}");
 
-                let entry = Entry::from_parts(id, final_path);
+                let entry = M2dirEntry::from_parts(id, final_path);
                 M2dirMessageStoreResult::Ok(entry)
             }
             (state, arg) => {

@@ -2,11 +2,11 @@
 
 use core::fmt::{self, Write};
 
-use alloc::string::String;
+use alloc::{string::String, vec::Vec};
 
 use thiserror::Error;
 
-use crate::{base64, fnv, path::M2dirPath};
+use crate::{base64, flag::M2dirFlags, fnv, path::M2dirPath};
 
 /// Errors that can occur while parsing or validating an entry
 /// filename.
@@ -36,13 +36,13 @@ pub enum ParseFilenameError {
 
 /// A single message entry inside an [`crate::m2dir::M2dir`].
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Entry {
+pub struct M2dirEntry {
     id: String,
     path: M2dirPath,
 }
 
-impl Entry {
-    /// Builds an [`Entry`] from a path and its unique id without
+impl M2dirEntry {
+    /// Builds an [`M2dirEntry`] from a path and its unique id without
     /// checking the on-disk checksum. Used by coroutines that have
     /// just delivered the entry and trust their own checksum.
     pub fn from_parts(id: impl Into<String>, path: impl Into<M2dirPath>) -> Self {
@@ -67,6 +67,38 @@ impl Entry {
     /// last `.`).
     pub fn checksum(&self) -> &str {
         self.id.rsplit_once('.').map(|(c, _)| c).unwrap_or(&self.id)
+    }
+}
+
+/// An [`M2dirEntry`] paired with its file contents and flags
+/// metadata, as produced by the bulk reads on
+/// [`M2dirClient`](crate::client::M2dirClient).
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct M2dirFullEntry {
+    entry: M2dirEntry,
+    contents: Vec<u8>,
+    flags: M2dirFlags,
+}
+
+impl M2dirFullEntry {
+    pub fn from_parts(entry: M2dirEntry, contents: Vec<u8>, flags: M2dirFlags) -> Self {
+        Self {
+            entry,
+            contents,
+            flags,
+        }
+    }
+
+    pub fn entry(&self) -> &M2dirEntry {
+        &self.entry
+    }
+
+    pub fn contents(&self) -> &[u8] {
+        &self.contents
+    }
+
+    pub fn flags(&self) -> &M2dirFlags {
+        &self.flags
     }
 }
 
