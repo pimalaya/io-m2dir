@@ -11,29 +11,13 @@ use alloc::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{entry::M2dirEntry, m2dir::M2dir, path::M2dirPath};
+use crate::{coroutine::*, entry::M2dirEntry, m2dir::M2dir, path::M2dirPath};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
 pub enum M2dirMessageListError {
     #[error("Invalid m2dir message list arg {0:?} for state {1:?}")]
     Invalid(Option<M2dirMessageListArg>, State),
-}
-
-/// Result returned by [`M2dirMessageList::resume`].
-#[derive(Clone, Debug)]
-pub enum M2dirMessageListResult {
-    /// The coroutine has successfully terminated its progression.
-    Ok(Vec<M2dirEntry>),
-    /// The caller must read the entries of the given directories
-    /// and feed back [`M2dirMessageListArg::DirRead`].
-    WantsDirRead(BTreeSet<M2dirPath>),
-    /// The caller must check whether the given paths exist as
-    /// regular files and feed back
-    /// [`M2dirMessageListArg::FileExists`].
-    WantsFileExists(BTreeSet<M2dirPath>),
-    /// The coroutine encountered an error.
-    Err(M2dirMessageListError),
 }
 
 /// Internal progression state of [`M2dirMessageList`].
@@ -48,12 +32,12 @@ pub enum State {
     Invalid,
 }
 
-/// Argument fed back to [`M2dirMessageList::resume`].
+/// Argument fed back into [`M2dirMessageList`].
 #[derive(Clone, Debug)]
 pub enum M2dirMessageListArg {
-    /// Response to [`M2dirMessageListResult::WantsDirRead`].
+    /// Response to [`M2dirCoroutineState::WantsDirRead`].
     DirRead(BTreeMap<M2dirPath, BTreeSet<M2dirPath>>),
-    /// Response to [`M2dirMessageListResult::WantsFileExists`].
+    /// Response to [`M2dirCoroutineState::WantsFileExists`].
     FileExists(BTreeMap<M2dirPath, bool>),
 }
 
@@ -77,19 +61,21 @@ impl M2dirMessageList {
             state: State::Start(m2dir),
         }
     }
+}
 
-    /// Makes the listing progress.
-    pub fn resume(
-        &mut self,
-        arg: Option<impl Into<M2dirMessageListArg>>,
-    ) -> M2dirMessageListResult {
-        match (mem::take(&mut self.state), arg.map(Into::into)) {
+impl M2dirCoroutine for M2dirMessageList {
+    type Arg = M2dirMessageListArg;
+    type Output = Vec<M2dirEntry>;
+    type Error = M2dirMessageListError;
+
+    fn resume(&mut self, arg: Option<Self::Arg>) -> M2dirCoroutineState<Self::Output, Self::Error> {
+        match (mem::take(&mut self.state), arg) {
             (State::Start(m2dir), None) => {
                 trace!("wants directory read of {}", m2dir.path());
 
                 let paths = BTreeSet::from_iter([m2dir.path().clone()]);
                 self.state = State::Reading;
-                M2dirMessageListResult::WantsDirRead(paths)
+                M2dirCoroutineState::WantsDirRead(paths)
             }
             (State::Reading, Some(M2dirMessageListArg::DirRead(entries))) => {
                 let mut candidates = BTreeMap::new();
@@ -115,14 +101,14 @@ impl M2dirMessageList {
 
                 if candidates.is_empty() {
                     trace!("no candidate entries");
-                    return M2dirMessageListResult::Ok(Vec::new());
+                    return M2dirCoroutineState::Done(Vec::new());
                 }
 
                 let probes: BTreeSet<M2dirPath> = candidates.keys().cloned().collect();
                 trace!("wants existence check for {} candidates", probes.len());
 
                 self.state = State::Checking { candidates };
-                M2dirMessageListResult::WantsFileExists(probes)
+                M2dirCoroutineState::WantsFileExists(probes)
             }
             (State::Checking { candidates }, Some(M2dirMessageListArg::FileExists(probes))) => {
                 let mut found = Vec::new();
@@ -134,11 +120,11 @@ impl M2dirMessageList {
                 }
 
                 trace!("found {} entries", found.len());
-                M2dirMessageListResult::Ok(found)
+                M2dirCoroutineState::Done(found)
             }
             (state, arg) => {
                 let err = M2dirMessageListError::Invalid(arg, state);
-                M2dirMessageListResult::Err(err)
+                M2dirCoroutineState::Err(err)
             }
         }
     }

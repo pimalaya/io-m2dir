@@ -5,7 +5,7 @@ use alloc::collections::BTreeSet;
 use log::trace;
 use thiserror::Error;
 
-use crate::path::M2dirPath;
+use crate::{coroutine::*, path::M2dirPath};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -14,23 +14,11 @@ pub enum M2dirMailboxDeleteError {
     Invalid(Option<M2dirMailboxDeleteArg>),
 }
 
-/// Result returned by [`M2dirMailboxDelete::resume`].
-#[derive(Clone, Debug)]
-pub enum M2dirMailboxDeleteResult {
-    /// The coroutine has successfully terminated its progression.
-    Ok,
-    /// The caller must recursively remove the given directories and
-    /// feed back [`M2dirMailboxDeleteArg::DirRemove`].
-    WantsDirRemove(BTreeSet<M2dirPath>),
-    /// The coroutine encountered an error.
-    Err(M2dirMailboxDeleteError),
-}
-
-/// Argument fed back to [`M2dirMailboxDelete::resume`] after the
-/// caller performed the requested filesystem operation.
+/// Argument fed back into [`M2dirMailboxDelete`] after the caller
+/// performed the requested filesystem operation.
 #[derive(Clone, Debug)]
 pub enum M2dirMailboxDeleteArg {
-    /// Response to [`M2dirMailboxDeleteResult::WantsDirRemove`].
+    /// Response to [`M2dirCoroutineState::WantsDirRemove`].
     DirRemove,
 }
 
@@ -50,24 +38,26 @@ impl M2dirMailboxDelete {
             wants_dir_remove: Some(paths),
         }
     }
+}
 
-    /// Makes the mailbox deletion progress.
-    pub fn resume(
-        &mut self,
-        arg: Option<impl Into<M2dirMailboxDeleteArg>>,
-    ) -> M2dirMailboxDeleteResult {
-        match (self.wants_dir_remove.take(), arg.map(Into::into)) {
+impl M2dirCoroutine for M2dirMailboxDelete {
+    type Arg = M2dirMailboxDeleteArg;
+    type Output = ();
+    type Error = M2dirMailboxDeleteError;
+
+    fn resume(&mut self, arg: Option<Self::Arg>) -> M2dirCoroutineState<Self::Output, Self::Error> {
+        match (self.wants_dir_remove.take(), arg) {
             (Some(paths), None) => {
                 trace!("wants filesystem I/O to remove {} directories", paths.len());
-                M2dirMailboxDeleteResult::WantsDirRemove(paths)
+                M2dirCoroutineState::WantsDirRemove(paths)
             }
             (None, Some(M2dirMailboxDeleteArg::DirRemove)) => {
                 trace!("resume after removing m2dir");
-                M2dirMailboxDeleteResult::Ok
+                M2dirCoroutineState::Done(())
             }
             (_, arg) => {
                 let err = M2dirMailboxDeleteError::Invalid(arg);
-                M2dirMailboxDeleteResult::Err(err)
+                M2dirCoroutineState::Err(err)
             }
         }
     }

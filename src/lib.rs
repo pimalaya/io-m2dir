@@ -10,6 +10,7 @@ extern crate std;
 pub mod base64;
 #[cfg(feature = "client")]
 pub mod client;
+pub mod coroutine;
 pub mod coroutines;
 pub mod entry;
 pub mod flag;

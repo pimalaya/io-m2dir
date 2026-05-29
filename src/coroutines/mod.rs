@@ -1,11 +1,15 @@
 //! Collection of I/O-free, resumable, and composable m2dir state
 //! machines.
 //!
-//! Each coroutine emits filesystem requests via the `Wants*` variants
-//! of its `*Result` enum (e.g. `WantsDirCreate`, `WantsFileRead`,
-//! `WantsFileCreate`, `WantsFileRemove`). The caller performs the
-//! matching operation and feeds the corresponding `*Arg` variant back
-//! into the next `resume` call to make progress.
+//! Every coroutine reports progression through the unified
+//! [`M2dirCoroutineState`](crate::coroutine::M2dirCoroutineState)
+//! enum (filesystem-flavoured `Wants*` variants, [`Done`], [`Err`])
+//! and consumes its own per-coroutine `Arg` enum on resume. Drive
+//! any coroutine end-to-end against the local filesystem via
+//! [`M2dirClient::run`](crate::client::M2dirClient::run).
+//!
+//! [`Done`]: crate::coroutine::M2dirCoroutineState::Done
+//! [`Err`]: crate::coroutine::M2dirCoroutineState::Err
 
 pub mod flag_add;
 pub mod flag_remove;

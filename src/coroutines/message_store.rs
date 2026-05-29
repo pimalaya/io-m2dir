@@ -10,6 +10,7 @@ use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use log::trace;
 use thiserror::Error;
 
+use crate::coroutine::*;
 use crate::entry::M2dirEntry;
 use crate::m2dir::M2dir;
 use crate::path::M2dirPath;
@@ -23,27 +24,6 @@ static TMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 pub enum M2dirMessageStoreError {
     #[error("Invalid m2dir message store arg {0:?} for state {1:?}")]
     Invalid(Option<M2dirMessageStoreArg>, State),
-}
-
-/// Result returned by [`M2dirMessageStore::resume`].
-#[derive(Clone, Debug)]
-pub enum M2dirMessageStoreResult {
-    /// The coroutine has successfully terminated its progression.
-    Ok(M2dirEntry),
-    /// The caller must provide the current process id and feed back
-    /// [`M2dirMessageStoreArg::Pid`].
-    WantsPid,
-    /// The caller must provide `len` random bytes and feed back
-    /// [`M2dirMessageStoreArg::Random`].
-    WantsRandom { len: usize },
-    /// The caller must write the given files with the given contents
-    /// and feed back [`M2dirMessageStoreArg::FileCreate`].
-    WantsFileCreate(BTreeMap<M2dirPath, Vec<u8>>),
-    /// The caller must rename each `(from, to)` pair and feed back
-    /// [`M2dirMessageStoreArg::Rename`].
-    WantsRename(Vec<(M2dirPath, M2dirPath)>),
-    /// The coroutine encountered an error.
-    Err(M2dirMessageStoreError),
 }
 
 /// Internal progression state of [`M2dirMessageStore`].
@@ -68,16 +48,16 @@ pub enum State {
     Invalid,
 }
 
-/// Argument fed back to [`M2dirMessageStore::resume`].
+/// Argument fed back into [`M2dirMessageStore`].
 #[derive(Clone, Debug)]
 pub enum M2dirMessageStoreArg {
-    /// Response to [`M2dirMessageStoreResult::WantsPid`].
+    /// Response to [`M2dirCoroutineState::WantsPid`].
     Pid(u32),
-    /// Response to [`M2dirMessageStoreResult::WantsRandom`].
+    /// Response to [`M2dirCoroutineState::WantsRandom`].
     Random(Vec<u8>),
-    /// Response to [`M2dirMessageStoreResult::WantsFileCreate`].
+    /// Response to [`M2dirCoroutineState::WantsFileCreate`].
     FileCreate,
-    /// Response to [`M2dirMessageStoreResult::WantsRename`].
+    /// Response to [`M2dirCoroutineState::WantsRename`].
     Rename,
 }
 
@@ -101,22 +81,24 @@ impl M2dirMessageStore {
             state: State::Start(bytes),
         }
     }
+}
 
-    /// Makes the message store progress.
-    pub fn resume(
-        &mut self,
-        arg: Option<impl Into<M2dirMessageStoreArg>>,
-    ) -> M2dirMessageStoreResult {
-        match (mem::take(&mut self.state), arg.map(Into::into)) {
+impl M2dirCoroutine for M2dirMessageStore {
+    type Arg = M2dirMessageStoreArg;
+    type Output = M2dirEntry;
+    type Error = M2dirMessageStoreError;
+
+    fn resume(&mut self, arg: Option<Self::Arg>) -> M2dirCoroutineState<Self::Output, Self::Error> {
+        match (mem::take(&mut self.state), arg) {
             (State::Start(bytes), None) => {
                 trace!("wants pid");
                 self.state = State::AwaitingPid(bytes);
-                M2dirMessageStoreResult::WantsPid
+                M2dirCoroutineState::WantsPid
             }
             (State::AwaitingPid(bytes), Some(M2dirMessageStoreArg::Pid(pid))) => {
                 trace!("wants {NONCE_LEN} random bytes");
                 self.state = State::AwaitingRandom { bytes, pid };
-                M2dirMessageStoreResult::WantsRandom { len: NONCE_LEN }
+                M2dirCoroutineState::WantsRandom { len: NONCE_LEN }
             }
             (State::AwaitingRandom { bytes, pid }, Some(M2dirMessageStoreArg::Random(nonce))) => {
                 let (id, final_path) = self.m2dir.entry_path(&bytes, &nonce);
@@ -131,7 +113,7 @@ impl M2dirMessageStore {
                     final_path,
                     id,
                 };
-                M2dirMessageStoreResult::WantsFileCreate(files)
+                M2dirCoroutineState::WantsFileCreate(files)
             }
             (
                 State::Created {
@@ -145,17 +127,17 @@ impl M2dirMessageStore {
 
                 let pairs = vec![(tmp_path, final_path.clone())];
                 self.state = State::Renamed { final_path, id };
-                M2dirMessageStoreResult::WantsRename(pairs)
+                M2dirCoroutineState::WantsRename(pairs)
             }
             (State::Renamed { final_path, id }, Some(M2dirMessageStoreArg::Rename)) => {
                 trace!("renamed tmp file to {final_path}");
 
                 let entry = M2dirEntry::from_parts(id, final_path);
-                M2dirMessageStoreResult::Ok(entry)
+                M2dirCoroutineState::Done(entry)
             }
             (state, arg) => {
                 let err = M2dirMessageStoreError::Invalid(arg, state);
-                M2dirMessageStoreResult::Err(err)
+                M2dirCoroutineState::Err(err)
             }
         }
     }

@@ -12,7 +12,9 @@ use alloc::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{coroutines::message_list::*, entry::M2dirEntry, m2dir::M2dir, path::M2dirPath};
+use crate::{
+    coroutine::*, coroutines::message_list::*, entry::M2dirEntry, m2dir::M2dir, path::M2dirPath,
+};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -25,25 +27,6 @@ pub enum M2dirMessageDeleteError {
     List(#[from] M2dirMessageListError),
 }
 
-/// Result returned by [`M2dirMessageDelete::resume`].
-#[derive(Clone, Debug)]
-pub enum M2dirMessageDeleteResult {
-    /// The coroutine has successfully terminated its progression.
-    Ok,
-    /// The caller must read the entries of the given directories
-    /// and feed back [`M2dirMessageDeleteArg::DirRead`].
-    WantsDirRead(BTreeSet<M2dirPath>),
-    /// The caller must check whether the given paths exist as
-    /// regular files and feed back
-    /// [`M2dirMessageDeleteArg::FileExists`].
-    WantsFileExists(BTreeSet<M2dirPath>),
-    /// The caller must remove the given files and feed back
-    /// [`M2dirMessageDeleteArg::FileRemove`].
-    WantsFileRemove(BTreeSet<M2dirPath>),
-    /// The coroutine encountered an error.
-    Err(M2dirMessageDeleteError),
-}
-
 /// Internal progression state of [`M2dirMessageDelete`].
 #[derive(Clone, Debug, Default)]
 pub enum State {
@@ -54,14 +37,14 @@ pub enum State {
     Invalid,
 }
 
-/// Argument fed back to [`M2dirMessageDelete::resume`].
+/// Argument fed back into [`M2dirMessageDelete`].
 #[derive(Clone, Debug)]
 pub enum M2dirMessageDeleteArg {
-    /// Response to [`M2dirMessageDeleteResult::WantsDirRead`].
+    /// Response to [`M2dirCoroutineState::WantsDirRead`].
     DirRead(BTreeMap<M2dirPath, BTreeSet<M2dirPath>>),
-    /// Response to [`M2dirMessageDeleteResult::WantsFileExists`].
+    /// Response to [`M2dirCoroutineState::WantsFileExists`].
     FileExists(BTreeMap<M2dirPath, bool>),
-    /// Response to [`M2dirMessageDeleteResult::WantsFileRemove`].
+    /// Response to [`M2dirCoroutineState::WantsFileRemove`].
     FileRemove,
 }
 
@@ -86,13 +69,15 @@ impl M2dirMessageDelete {
             state: State::List(M2dirMessageList::new(m2dir)),
         }
     }
+}
 
-    /// Makes the message deletion progress.
-    pub fn resume(
-        &mut self,
-        arg: Option<impl Into<M2dirMessageDeleteArg>>,
-    ) -> M2dirMessageDeleteResult {
-        match (mem::take(&mut self.state), arg.map(Into::into)) {
+impl M2dirCoroutine for M2dirMessageDelete {
+    type Arg = M2dirMessageDeleteArg;
+    type Output = ();
+    type Error = M2dirMessageDeleteError;
+
+    fn resume(&mut self, arg: Option<Self::Arg>) -> M2dirCoroutineState<Self::Output, Self::Error> {
+        match (mem::take(&mut self.state), arg) {
             (State::List(mut list), arg) => {
                 let list_arg = match arg {
                     None => None,
@@ -105,32 +90,33 @@ impl M2dirMessageDelete {
                     Some(other) => {
                         let state = State::List(list);
                         let err = M2dirMessageDeleteError::Invalid(Some(other), state);
-                        return M2dirMessageDeleteResult::Err(err);
+                        return M2dirCoroutineState::Err(err);
                     }
                 };
 
                 match list.resume(list_arg) {
-                    M2dirMessageListResult::WantsDirRead(paths) => {
+                    M2dirCoroutineState::WantsDirRead(paths) => {
                         self.state = State::List(list);
-                        M2dirMessageDeleteResult::WantsDirRead(paths)
+                        M2dirCoroutineState::WantsDirRead(paths)
                     }
-                    M2dirMessageListResult::WantsFileExists(paths) => {
+                    M2dirCoroutineState::WantsFileExists(paths) => {
                         self.state = State::List(list);
-                        M2dirMessageDeleteResult::WantsFileExists(paths)
+                        M2dirCoroutineState::WantsFileExists(paths)
                     }
-                    M2dirMessageListResult::Ok(entries) => {
+                    M2dirCoroutineState::Done(entries) => {
                         let Some(entry) = entries.into_iter().find(|e| e.id() == self.id) else {
                             let err = M2dirMessageDeleteError::NotFound(self.id.clone());
-                            return M2dirMessageDeleteResult::Err(err);
+                            return M2dirCoroutineState::Err(err);
                         };
 
                         trace!("located entry at {}", entry.path());
 
                         let paths = BTreeSet::from_iter([self.meta_dir.clone()]);
                         self.state = State::ReadMeta(entry);
-                        M2dirMessageDeleteResult::WantsDirRead(paths)
+                        M2dirCoroutineState::WantsDirRead(paths)
                     }
-                    M2dirMessageListResult::Err(err) => M2dirMessageDeleteResult::Err(err.into()),
+                    M2dirCoroutineState::Err(err) => M2dirCoroutineState::Err(err.into()),
+                    other => unreachable!("M2dirMessageList yielded {other:?}"),
                 }
             }
             (State::ReadMeta(entry), Some(M2dirMessageDeleteArg::DirRead(entries))) => {
@@ -151,15 +137,15 @@ impl M2dirMessageDelete {
                 trace!("wants removal of {} files", to_remove.len());
 
                 self.state = State::Removing;
-                M2dirMessageDeleteResult::WantsFileRemove(BTreeSet::from_iter(to_remove))
+                M2dirCoroutineState::WantsFileRemove(BTreeSet::from_iter(to_remove))
             }
             (State::Removing, Some(M2dirMessageDeleteArg::FileRemove)) => {
                 trace!("entry deleted");
-                M2dirMessageDeleteResult::Ok
+                M2dirCoroutineState::Done(())
             }
             (state, arg) => {
                 let err = M2dirMessageDeleteError::Invalid(arg, state);
-                M2dirMessageDeleteResult::Err(err)
+                M2dirCoroutineState::Err(err)
             }
         }
     }

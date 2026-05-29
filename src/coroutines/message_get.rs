@@ -12,6 +12,7 @@ use log::trace;
 use thiserror::Error;
 
 use crate::{
+    coroutine::*,
     coroutines::message_list::*,
     entry::{M2dirEntry, ParseFilenameError, validate_checksum},
     m2dir::M2dir,
@@ -31,26 +32,11 @@ pub enum M2dirMessageGetError {
     Parse(#[from] ParseFilenameError),
 }
 
-/// Result returned by [`M2dirMessageGet::resume`].
+/// Successful output of [`M2dirMessageGet`].
 #[derive(Clone, Debug)]
-pub enum M2dirMessageGetResult {
-    /// The coroutine has successfully terminated its progression.
-    Ok {
-        entry: M2dirEntry,
-        contents: Vec<u8>,
-    },
-    /// The caller must read the entries of the given directories
-    /// and feed back [`M2dirMessageGetArg::DirRead`].
-    WantsDirRead(BTreeSet<M2dirPath>),
-    /// The caller must check whether the given paths exist as
-    /// regular files and feed back
-    /// [`M2dirMessageGetArg::FileExists`].
-    WantsFileExists(BTreeSet<M2dirPath>),
-    /// The caller must read the contents of the given files and
-    /// feed back [`M2dirMessageGetArg::FileRead`].
-    WantsFileRead(BTreeSet<M2dirPath>),
-    /// The coroutine encountered an error.
-    Err(M2dirMessageGetError),
+pub struct M2dirMessageGetOk {
+    pub entry: M2dirEntry,
+    pub contents: Vec<u8>,
 }
 
 /// Internal progression state of [`M2dirMessageGet`].
@@ -62,14 +48,14 @@ pub enum State {
     Invalid,
 }
 
-/// Argument fed back to [`M2dirMessageGet::resume`].
+/// Argument fed back into [`M2dirMessageGet`].
 #[derive(Clone, Debug)]
 pub enum M2dirMessageGetArg {
-    /// Response to [`M2dirMessageGetResult::WantsDirRead`].
+    /// Forwarded to the inner list coroutine.
     DirRead(BTreeMap<M2dirPath, BTreeSet<M2dirPath>>),
-    /// Response to [`M2dirMessageGetResult::WantsFileExists`].
+    /// Forwarded to the inner list coroutine.
     FileExists(BTreeMap<M2dirPath, bool>),
-    /// Response to [`M2dirMessageGetResult::WantsFileRead`].
+    /// Response to [`M2dirCoroutineState::WantsFileRead`].
     FileRead(BTreeMap<M2dirPath, Vec<u8>>),
 }
 
@@ -91,10 +77,15 @@ impl M2dirMessageGet {
             state: State::List(M2dirMessageList::new(m2dir)),
         }
     }
+}
 
-    /// Makes the message get progress.
-    pub fn resume(&mut self, arg: Option<impl Into<M2dirMessageGetArg>>) -> M2dirMessageGetResult {
-        match (mem::take(&mut self.state), arg.map(Into::into)) {
+impl M2dirCoroutine for M2dirMessageGet {
+    type Arg = M2dirMessageGetArg;
+    type Output = M2dirMessageGetOk;
+    type Error = M2dirMessageGetError;
+
+    fn resume(&mut self, arg: Option<Self::Arg>) -> M2dirCoroutineState<Self::Output, Self::Error> {
+        match (mem::take(&mut self.state), arg) {
             (State::List(mut list), arg) => {
                 let list_arg = match arg {
                     None => None,
@@ -107,32 +98,33 @@ impl M2dirMessageGet {
                     Some(other) => {
                         let state = State::List(list);
                         let err = M2dirMessageGetError::Invalid(Some(other), state);
-                        return M2dirMessageGetResult::Err(err);
+                        return M2dirCoroutineState::Err(err);
                     }
                 };
 
                 match list.resume(list_arg) {
-                    M2dirMessageListResult::WantsDirRead(paths) => {
+                    M2dirCoroutineState::WantsDirRead(paths) => {
                         self.state = State::List(list);
-                        M2dirMessageGetResult::WantsDirRead(paths)
+                        M2dirCoroutineState::WantsDirRead(paths)
                     }
-                    M2dirMessageListResult::WantsFileExists(paths) => {
+                    M2dirCoroutineState::WantsFileExists(paths) => {
                         self.state = State::List(list);
-                        M2dirMessageGetResult::WantsFileExists(paths)
+                        M2dirCoroutineState::WantsFileExists(paths)
                     }
-                    M2dirMessageListResult::Ok(entries) => {
+                    M2dirCoroutineState::Done(entries) => {
                         let Some(entry) = entries.into_iter().find(|e| e.id() == self.id) else {
                             let err = M2dirMessageGetError::NotFound(self.id.clone());
-                            return M2dirMessageGetResult::Err(err);
+                            return M2dirCoroutineState::Err(err);
                         };
 
                         trace!("located entry at {}", entry.path());
 
                         let paths = BTreeSet::from_iter([entry.path().clone()]);
                         self.state = State::Read(entry);
-                        M2dirMessageGetResult::WantsFileRead(paths)
+                        M2dirCoroutineState::WantsFileRead(paths)
                     }
-                    M2dirMessageListResult::Err(err) => M2dirMessageGetResult::Err(err.into()),
+                    M2dirCoroutineState::Err(err) => M2dirCoroutineState::Err(err.into()),
+                    other => unreachable!("M2dirMessageList yielded {other:?}"),
                 }
             }
             (State::Read(entry), Some(M2dirMessageGetArg::FileRead(contents))) => {
@@ -145,17 +137,17 @@ impl M2dirMessageGet {
                         expected: checksum.to_string(),
                         got: entry.id().to_string(),
                     };
-                    return M2dirMessageGetResult::Err(err.into());
+                    return M2dirCoroutineState::Err(err.into());
                 }
 
-                M2dirMessageGetResult::Ok {
+                M2dirCoroutineState::Done(M2dirMessageGetOk {
                     entry,
                     contents: bytes,
-                }
+                })
             }
             (state, arg) => {
                 let err = M2dirMessageGetError::Invalid(arg, state);
-                M2dirMessageGetResult::Err(err)
+                M2dirCoroutineState::Err(err)
             }
         }
     }

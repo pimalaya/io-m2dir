@@ -11,9 +11,9 @@ use log::trace;
 use thiserror::Error;
 
 use crate::{
+    coroutine::*,
     m2dir::M2dir,
     m2store::{M2store, NewFolderError},
-    path::M2dirPath,
 };
 
 /// Errors that can occur during the coroutine progression.
@@ -23,21 +23,6 @@ pub enum M2dirMailboxCreateError {
     Invalid(Option<M2dirMailboxCreateArg>, State),
     #[error(transparent)]
     Resolve(#[from] NewFolderError),
-}
-
-/// Result returned by [`M2dirMailboxCreate::resume`].
-#[derive(Clone, Debug)]
-pub enum M2dirMailboxCreateResult {
-    /// The coroutine has successfully terminated its progression.
-    Ok(M2dir),
-    /// The caller must recursively create the given directories and
-    /// feed back [`M2dirMailboxCreateArg::DirCreate`].
-    WantsDirCreate(BTreeSet<M2dirPath>),
-    /// The caller must write the given files with the given contents
-    /// and feed back [`M2dirMailboxCreateArg::FileCreate`].
-    WantsFileCreate(BTreeMap<M2dirPath, Vec<u8>>),
-    /// The coroutine encountered an error.
-    Err(M2dirMailboxCreateError),
 }
 
 /// Internal progression state of [`M2dirMailboxCreate`].
@@ -50,13 +35,13 @@ pub enum State {
     Invalid,
 }
 
-/// Argument fed back to [`M2dirMailboxCreate::resume`] after the
-/// caller performed the requested filesystem operation.
+/// Argument fed back into [`M2dirMailboxCreate`] after the caller
+/// performed the requested filesystem operation.
 #[derive(Clone, Debug)]
 pub enum M2dirMailboxCreateArg {
-    /// Response to [`M2dirMailboxCreateResult::WantsDirCreate`].
+    /// Response to [`M2dirCoroutineState::WantsDirCreate`].
     DirCreate,
-    /// Response to [`M2dirMailboxCreateResult::WantsFileCreate`].
+    /// Response to [`M2dirCoroutineState::WantsFileCreate`].
     FileCreate,
 }
 
@@ -85,13 +70,15 @@ impl M2dirMailboxCreate {
     pub fn m2dir(&self) -> &M2dir {
         &self.m2dir
     }
+}
 
-    /// Makes the mailbox creation progress.
-    pub fn resume(
-        &mut self,
-        arg: Option<impl Into<M2dirMailboxCreateArg>>,
-    ) -> M2dirMailboxCreateResult {
-        match (mem::take(&mut self.state), arg.map(Into::into)) {
+impl M2dirCoroutine for M2dirMailboxCreate {
+    type Arg = M2dirMailboxCreateArg;
+    type Output = M2dir;
+    type Error = M2dirMailboxCreateError;
+
+    fn resume(&mut self, arg: Option<Self::Arg>) -> M2dirCoroutineState<Self::Output, Self::Error> {
+        match (mem::take(&mut self.state), arg) {
             (State::Start, None) => {
                 trace!("wants directory creation for {}", self.m2dir.path());
 
@@ -100,7 +87,7 @@ impl M2dirMailboxCreate {
                 let paths = BTreeSet::from_iter([root, meta]);
 
                 self.state = State::DirCreated;
-                M2dirMailboxCreateResult::WantsDirCreate(paths)
+                M2dirCoroutineState::WantsDirCreate(paths)
             }
             (State::DirCreated, Some(M2dirMailboxCreateArg::DirCreate)) => {
                 trace!("wants marker file at {}", self.m2dir.marker_path());
@@ -109,15 +96,15 @@ impl M2dirMailboxCreate {
                 let files = BTreeMap::from_iter([(marker, Vec::new())]);
 
                 self.state = State::MarkerWritten;
-                M2dirMailboxCreateResult::WantsFileCreate(files)
+                M2dirCoroutineState::WantsFileCreate(files)
             }
             (State::MarkerWritten, Some(M2dirMailboxCreateArg::FileCreate)) => {
                 trace!("mailbox created at {}", self.m2dir.path());
-                M2dirMailboxCreateResult::Ok(self.m2dir.clone())
+                M2dirCoroutineState::Done(self.m2dir.clone())
             }
             (state, arg) => {
                 let err = M2dirMailboxCreateError::Invalid(arg, state);
-                M2dirMailboxCreateResult::Err(err)
+                M2dirCoroutineState::Err(err)
             }
         }
     }

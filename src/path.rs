@@ -103,6 +103,27 @@ impl From<&str> for M2dirPath {
     }
 }
 
+#[cfg(feature = "client")]
+impl From<std::path::PathBuf> for M2dirPath {
+    fn from(path: std::path::PathBuf) -> Self {
+        Self(path.to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(feature = "client")]
+impl From<&std::path::Path> for M2dirPath {
+    fn from(path: &std::path::Path) -> Self {
+        Self(path.to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(feature = "client")]
+impl From<M2dirPath> for std::path::PathBuf {
+    fn from(path: M2dirPath) -> Self {
+        Self::from(path.0)
+    }
+}
+
 impl AsRef<str> for M2dirPath {
     fn as_ref(&self) -> &str {
         &self.0
