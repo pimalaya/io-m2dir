@@ -3,10 +3,7 @@
 
 use core::mem;
 
-use alloc::{
-    collections::{BTreeMap, BTreeSet},
-    vec::Vec,
-};
+use alloc::collections::{BTreeMap, BTreeSet};
 
 use log::trace;
 use thiserror::Error;
@@ -17,7 +14,7 @@ use crate::{coroutine::*, flag::M2dirFlags, m2dir::M2dir, path::M2dirPath};
 #[derive(Clone, Debug, Error)]
 pub enum M2dirFlagAddError {
     #[error("Invalid m2dir flags add arg {0:?} for state {1:?}")]
-    Invalid(Option<M2dirFlagAddArg>, State),
+    Invalid(Option<M2dirArg>, State),
 }
 
 /// Internal progression state of [`M2dirFlagAdd`].
@@ -28,16 +25,6 @@ pub enum State {
     Written,
     #[default]
     Invalid,
-}
-
-/// Argument fed back into [`M2dirFlagAdd`].
-#[derive(Clone, Debug)]
-pub enum M2dirFlagAddArg {
-    /// Response to [`M2dirCoroutineState::WantsFileRead`]. Missing
-    /// files may be reported as an empty byte buffer.
-    FileRead(BTreeMap<M2dirPath, Vec<u8>>),
-    /// Response to [`M2dirCoroutineState::WantsFileCreate`].
-    FileCreate,
 }
 
 /// I/O-free coroutine to add `flags` to entry `id`'s flags
@@ -64,20 +51,19 @@ impl M2dirFlagAdd {
 }
 
 impl M2dirCoroutine for M2dirFlagAdd {
-    type Arg = M2dirFlagAddArg;
-    type Output = ();
-    type Error = M2dirFlagAddError;
+    type Yield = M2dirYield;
+    type Return = Result<(), M2dirFlagAddError>;
 
-    fn resume(&mut self, arg: Option<Self::Arg>) -> M2dirCoroutineState<Self::Output, Self::Error> {
+    fn resume(&mut self, arg: Option<M2dirArg>) -> M2dirCoroutineState<Self::Yield, Self::Return> {
         match (mem::take(&mut self.state), arg) {
             (State::Start, None) => {
                 trace!("wants existing flags read at {}", self.flags_path);
 
                 let paths = BTreeSet::from_iter([self.flags_path.clone()]);
                 self.state = State::Read;
-                M2dirCoroutineState::WantsFileRead(paths)
+                M2dirCoroutineState::Yielded(M2dirYield::WantsFileRead(paths))
             }
-            (State::Read, Some(M2dirFlagAddArg::FileRead(contents))) => {
+            (State::Read, Some(M2dirArg::FileRead(contents))) => {
                 let bytes = contents.into_values().next().unwrap_or_default();
                 let existing = core::str::from_utf8(&bytes).unwrap_or("");
 
@@ -94,15 +80,15 @@ impl M2dirCoroutine for M2dirFlagAdd {
                 let files = BTreeMap::from_iter([(self.flags_path.clone(), serialized)]);
 
                 self.state = State::Written;
-                M2dirCoroutineState::WantsFileCreate(files)
+                M2dirCoroutineState::Yielded(M2dirYield::WantsFileCreate(files))
             }
-            (State::Written, Some(M2dirFlagAddArg::FileCreate)) => {
+            (State::Written, Some(M2dirArg::FileCreate)) => {
                 trace!("flags added to {}", self.flags_path);
-                M2dirCoroutineState::Done(())
+                M2dirCoroutineState::Complete(Ok(()))
             }
             (state, arg) => {
                 let err = M2dirFlagAddError::Invalid(arg, state);
-                M2dirCoroutineState::Err(err)
+                M2dirCoroutineState::Complete(Err(err))
             }
         }
     }

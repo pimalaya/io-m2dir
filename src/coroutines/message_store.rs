@@ -23,7 +23,7 @@ static TMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 #[derive(Clone, Debug, Error)]
 pub enum M2dirMessageStoreError {
     #[error("Invalid m2dir message store arg {0:?} for state {1:?}")]
-    Invalid(Option<M2dirMessageStoreArg>, State),
+    Invalid(Option<M2dirArg>, State),
 }
 
 /// Internal progression state of [`M2dirMessageStore`].
@@ -46,19 +46,6 @@ pub enum State {
     },
     #[default]
     Invalid,
-}
-
-/// Argument fed back into [`M2dirMessageStore`].
-#[derive(Clone, Debug)]
-pub enum M2dirMessageStoreArg {
-    /// Response to [`M2dirCoroutineState::WantsPid`].
-    Pid(u32),
-    /// Response to [`M2dirCoroutineState::WantsRandom`].
-    Random(Vec<u8>),
-    /// Response to [`M2dirCoroutineState::WantsFileCreate`].
-    FileCreate,
-    /// Response to [`M2dirCoroutineState::WantsRename`].
-    Rename,
 }
 
 /// I/O-free coroutine to store a message in an m2dir.
@@ -84,23 +71,22 @@ impl M2dirMessageStore {
 }
 
 impl M2dirCoroutine for M2dirMessageStore {
-    type Arg = M2dirMessageStoreArg;
-    type Output = M2dirEntry;
-    type Error = M2dirMessageStoreError;
+    type Yield = M2dirYield;
+    type Return = Result<M2dirEntry, M2dirMessageStoreError>;
 
-    fn resume(&mut self, arg: Option<Self::Arg>) -> M2dirCoroutineState<Self::Output, Self::Error> {
+    fn resume(&mut self, arg: Option<M2dirArg>) -> M2dirCoroutineState<Self::Yield, Self::Return> {
         match (mem::take(&mut self.state), arg) {
             (State::Start(bytes), None) => {
                 trace!("wants pid");
                 self.state = State::AwaitingPid(bytes);
-                M2dirCoroutineState::WantsPid
+                M2dirCoroutineState::Yielded(M2dirYield::WantsPid)
             }
-            (State::AwaitingPid(bytes), Some(M2dirMessageStoreArg::Pid(pid))) => {
+            (State::AwaitingPid(bytes), Some(M2dirArg::Pid(pid))) => {
                 trace!("wants {NONCE_LEN} random bytes");
                 self.state = State::AwaitingRandom { bytes, pid };
-                M2dirCoroutineState::WantsRandom { len: NONCE_LEN }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsRandom { len: NONCE_LEN })
             }
-            (State::AwaitingRandom { bytes, pid }, Some(M2dirMessageStoreArg::Random(nonce))) => {
+            (State::AwaitingRandom { bytes, pid }, Some(M2dirArg::Random(nonce))) => {
                 let (id, final_path) = self.m2dir.entry_path(&bytes, &nonce);
                 let counter = TMP_COUNTER.fetch_add(1, Ordering::AcqRel);
                 let tmp_path = self.m2dir.tmp_path(pid, counter);
@@ -113,7 +99,7 @@ impl M2dirCoroutine for M2dirMessageStore {
                     final_path,
                     id,
                 };
-                M2dirCoroutineState::WantsFileCreate(files)
+                M2dirCoroutineState::Yielded(M2dirYield::WantsFileCreate(files))
             }
             (
                 State::Created {
@@ -121,23 +107,23 @@ impl M2dirCoroutine for M2dirMessageStore {
                     final_path,
                     id,
                 },
-                Some(M2dirMessageStoreArg::FileCreate),
+                Some(M2dirArg::FileCreate),
             ) => {
                 trace!("created tmp file, wants rename to {final_path}");
 
                 let pairs = vec![(tmp_path, final_path.clone())];
                 self.state = State::Renamed { final_path, id };
-                M2dirCoroutineState::WantsRename(pairs)
+                M2dirCoroutineState::Yielded(M2dirYield::WantsRename(pairs))
             }
-            (State::Renamed { final_path, id }, Some(M2dirMessageStoreArg::Rename)) => {
+            (State::Renamed { final_path, id }, Some(M2dirArg::Rename)) => {
                 trace!("renamed tmp file to {final_path}");
 
                 let entry = M2dirEntry::from_parts(id, final_path);
-                M2dirCoroutineState::Done(entry)
+                M2dirCoroutineState::Complete(Ok(entry))
             }
             (state, arg) => {
                 let err = M2dirMessageStoreError::Invalid(arg, state);
-                M2dirCoroutineState::Err(err)
+                M2dirCoroutineState::Complete(Err(err))
             }
         }
     }

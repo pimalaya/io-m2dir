@@ -3,10 +3,7 @@
 
 use core::mem;
 
-use alloc::{
-    collections::{BTreeMap, BTreeSet},
-    vec::Vec,
-};
+use alloc::collections::{BTreeMap, BTreeSet};
 
 use log::trace;
 use thiserror::Error;
@@ -17,7 +14,7 @@ use crate::{coroutine::*, flag::M2dirFlags, m2dir::M2dir, path::M2dirPath};
 #[derive(Clone, Debug, Error)]
 pub enum M2dirFlagRemoveError {
     #[error("Invalid m2dir flags remove arg {0:?} for state {1:?}")]
-    Invalid(Option<M2dirFlagRemoveArg>, State),
+    Invalid(Option<M2dirArg>, State),
 }
 
 /// Internal progression state of [`M2dirFlagRemove`].
@@ -28,17 +25,6 @@ pub enum State {
     Done,
     #[default]
     Invalid,
-}
-
-/// Argument fed back into [`M2dirFlagRemove`].
-#[derive(Clone, Debug)]
-pub enum M2dirFlagRemoveArg {
-    /// Response to [`M2dirCoroutineState::WantsFileRead`].
-    FileRead(BTreeMap<M2dirPath, Vec<u8>>),
-    /// Response to [`M2dirCoroutineState::WantsFileCreate`].
-    FileCreate,
-    /// Response to [`M2dirCoroutineState::WantsFileRemove`].
-    FileRemove,
 }
 
 /// I/O-free coroutine to remove `flags` from entry `id`'s flags
@@ -65,20 +51,19 @@ impl M2dirFlagRemove {
 }
 
 impl M2dirCoroutine for M2dirFlagRemove {
-    type Arg = M2dirFlagRemoveArg;
-    type Output = ();
-    type Error = M2dirFlagRemoveError;
+    type Yield = M2dirYield;
+    type Return = Result<(), M2dirFlagRemoveError>;
 
-    fn resume(&mut self, arg: Option<Self::Arg>) -> M2dirCoroutineState<Self::Output, Self::Error> {
+    fn resume(&mut self, arg: Option<M2dirArg>) -> M2dirCoroutineState<Self::Yield, Self::Return> {
         match (mem::take(&mut self.state), arg) {
             (State::Start, None) => {
                 trace!("wants existing flags read at {}", self.flags_path);
 
                 let paths = BTreeSet::from_iter([self.flags_path.clone()]);
                 self.state = State::Read;
-                M2dirCoroutineState::WantsFileRead(paths)
+                M2dirCoroutineState::Yielded(M2dirYield::WantsFileRead(paths))
             }
-            (State::Read, Some(M2dirFlagRemoveArg::FileRead(contents))) => {
+            (State::Read, Some(M2dirArg::FileRead(contents))) => {
                 let bytes = contents.into_values().next().unwrap_or_default();
                 let existing = core::str::from_utf8(&bytes).unwrap_or("");
 
@@ -91,7 +76,7 @@ impl M2dirCoroutine for M2dirFlagRemove {
                     trace!("wants flags remove at {}", self.flags_path);
 
                     let paths = BTreeSet::from_iter([self.flags_path.clone()]);
-                    M2dirCoroutineState::WantsFileRemove(paths)
+                    M2dirCoroutineState::Yielded(M2dirYield::WantsFileRemove(paths))
                 } else {
                     trace!(
                         "wants flags write at {} ({} flags)",
@@ -102,19 +87,16 @@ impl M2dirCoroutine for M2dirFlagRemove {
                     let serialized = remaining.to_meta().into_bytes();
                     let files = BTreeMap::from_iter([(self.flags_path.clone(), serialized)]);
 
-                    M2dirCoroutineState::WantsFileCreate(files)
+                    M2dirCoroutineState::Yielded(M2dirYield::WantsFileCreate(files))
                 }
             }
-            (
-                State::Done,
-                Some(M2dirFlagRemoveArg::FileCreate | M2dirFlagRemoveArg::FileRemove),
-            ) => {
+            (State::Done, Some(M2dirArg::FileCreate | M2dirArg::FileRemove)) => {
                 trace!("flags removed from {}", self.flags_path);
-                M2dirCoroutineState::Done(())
+                M2dirCoroutineState::Complete(Ok(()))
             }
             (state, arg) => {
                 let err = M2dirFlagRemoveError::Invalid(arg, state);
-                M2dirCoroutineState::Err(err)
+                M2dirCoroutineState::Complete(Err(err))
             }
         }
     }

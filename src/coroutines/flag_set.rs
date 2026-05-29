@@ -14,7 +14,7 @@ use crate::{coroutine::*, flag::M2dirFlags, m2dir::M2dir, path::M2dirPath};
 #[derive(Clone, Debug, Error)]
 pub enum M2dirFlagSetError {
     #[error("Invalid m2dir flags set arg {0:?} for state {1:?}")]
-    Invalid(Option<M2dirFlagSetArg>, State),
+    Invalid(Option<M2dirArg>, State),
 }
 
 /// Internal progression state of [`M2dirFlagSet`].
@@ -24,15 +24,6 @@ pub enum State {
     Done,
     #[default]
     Invalid,
-}
-
-/// Argument fed back into [`M2dirFlagSet`].
-#[derive(Clone, Debug)]
-pub enum M2dirFlagSetArg {
-    /// Response to [`M2dirCoroutineState::WantsFileCreate`].
-    FileCreate,
-    /// Response to [`M2dirCoroutineState::WantsFileRemove`].
-    FileRemove,
 }
 
 /// I/O-free coroutine to replace an entry's flags metadata file
@@ -62,11 +53,10 @@ impl M2dirFlagSet {
 }
 
 impl M2dirCoroutine for M2dirFlagSet {
-    type Arg = M2dirFlagSetArg;
-    type Output = ();
-    type Error = M2dirFlagSetError;
+    type Yield = M2dirYield;
+    type Return = Result<(), M2dirFlagSetError>;
 
-    fn resume(&mut self, arg: Option<Self::Arg>) -> M2dirCoroutineState<Self::Output, Self::Error> {
+    fn resume(&mut self, arg: Option<M2dirArg>) -> M2dirCoroutineState<Self::Yield, Self::Return> {
         match (mem::take(&mut self.state), arg) {
             (State::Start, None) => {
                 self.state = State::Done;
@@ -75,7 +65,7 @@ impl M2dirCoroutine for M2dirFlagSet {
                     trace!("wants flags remove at {}", self.flags_path);
 
                     let paths = BTreeSet::from_iter([self.flags_path.clone()]);
-                    M2dirCoroutineState::WantsFileRemove(paths)
+                    M2dirCoroutineState::Yielded(M2dirYield::WantsFileRemove(paths))
                 } else {
                     trace!(
                         "wants flags write at {} ({} flags)",
@@ -86,16 +76,16 @@ impl M2dirCoroutine for M2dirFlagSet {
                     let serialized = self.flags.to_meta().into_bytes();
                     let files = BTreeMap::from_iter([(self.flags_path.clone(), serialized)]);
 
-                    M2dirCoroutineState::WantsFileCreate(files)
+                    M2dirCoroutineState::Yielded(M2dirYield::WantsFileCreate(files))
                 }
             }
-            (State::Done, Some(M2dirFlagSetArg::FileCreate | M2dirFlagSetArg::FileRemove)) => {
+            (State::Done, Some(M2dirArg::FileCreate | M2dirArg::FileRemove)) => {
                 trace!("flags set at {}", self.flags_path);
-                M2dirCoroutineState::Done(())
+                M2dirCoroutineState::Complete(Ok(()))
             }
             (state, arg) => {
                 let err = M2dirFlagSetError::Invalid(arg, state);
-                M2dirCoroutineState::Err(err)
+                M2dirCoroutineState::Complete(Err(err))
             }
         }
     }

@@ -18,7 +18,7 @@ use crate::{
 #[derive(Clone, Debug, Error)]
 pub enum M2dirMailboxListError {
     #[error("Invalid m2dir mailbox list arg {0:?} for state {1:?}")]
-    Invalid(Option<M2dirMailboxListArg>, State),
+    Invalid(Option<M2dirArg>, State),
 }
 
 /// Internal progression state of [`M2dirMailboxList`].
@@ -38,21 +38,6 @@ pub enum State {
     },
     #[default]
     Invalid,
-}
-
-/// Argument fed back into [`M2dirMailboxList`].
-#[derive(Clone, Debug)]
-pub enum M2dirMailboxListArg {
-    /// Response to [`M2dirCoroutineState::WantsDirRead`].
-    ///
-    /// Maps each requested directory path to the set of entry paths
-    /// found inside it.
-    DirRead(BTreeMap<M2dirPath, BTreeSet<M2dirPath>>),
-    /// Response to [`M2dirCoroutineState::WantsFileExists`].
-    ///
-    /// Maps each probed marker path to whether it exists as a
-    /// regular file.
-    FileExists(BTreeMap<M2dirPath, bool>),
 }
 
 /// I/O-free coroutine to list every valid m2dir inside an m2store.
@@ -82,11 +67,10 @@ impl M2dirMailboxList {
 }
 
 impl M2dirCoroutine for M2dirMailboxList {
-    type Arg = M2dirMailboxListArg;
-    type Output = BTreeSet<M2dir>;
-    type Error = M2dirMailboxListError;
+    type Yield = M2dirYield;
+    type Return = Result<BTreeSet<M2dir>, M2dirMailboxListError>;
 
-    fn resume(&mut self, arg: Option<Self::Arg>) -> M2dirCoroutineState<Self::Output, Self::Error> {
+    fn resume(&mut self, arg: Option<M2dirArg>) -> M2dirCoroutineState<Self::Yield, Self::Return> {
         match (mem::take(&mut self.state), arg) {
             (State::Scanning { pending, found }, None) => {
                 let batch = pending;
@@ -96,12 +80,9 @@ impl M2dirCoroutine for M2dirMailboxList {
                     pending: BTreeSet::new(),
                     found,
                 };
-                M2dirCoroutineState::WantsDirRead(batch)
+                M2dirCoroutineState::Yielded(M2dirYield::WantsDirRead(batch))
             }
-            (
-                State::Scanning { mut pending, found },
-                Some(M2dirMailboxListArg::DirRead(entries)),
-            ) => {
+            (State::Scanning { mut pending, found }, Some(M2dirArg::DirRead(entries))) => {
                 trace!("scanned {} directories", entries.len());
 
                 let mut markers = BTreeMap::new();
@@ -126,7 +107,7 @@ impl M2dirCoroutine for M2dirMailboxList {
                 if markers.is_empty() {
                     if next_pending.is_empty() {
                         trace!("found {} m2dirs", found.len());
-                        return M2dirCoroutineState::Done(found);
+                        return M2dirCoroutineState::Complete(Ok(found));
                     }
 
                     let batch = next_pending;
@@ -134,7 +115,7 @@ impl M2dirCoroutine for M2dirMailboxList {
                         pending: BTreeSet::new(),
                         found,
                     };
-                    return M2dirCoroutineState::WantsDirRead(batch);
+                    return M2dirCoroutineState::Yielded(M2dirYield::WantsDirRead(batch));
                 }
 
                 let probes: BTreeSet<M2dirPath> = markers.keys().cloned().collect();
@@ -145,7 +126,7 @@ impl M2dirCoroutine for M2dirMailboxList {
                     markers,
                     found,
                 };
-                M2dirCoroutineState::WantsFileExists(probes)
+                M2dirCoroutineState::Yielded(M2dirYield::WantsFileExists(probes))
             }
             (
                 State::CheckingMarkers {
@@ -153,7 +134,7 @@ impl M2dirCoroutine for M2dirMailboxList {
                     markers,
                     mut found,
                 },
-                Some(M2dirMailboxListArg::FileExists(probes)),
+                Some(M2dirArg::FileExists(probes)),
             ) => {
                 for (marker, dir) in markers {
                     if probes.get(&marker).copied().unwrap_or(false) {
@@ -163,7 +144,7 @@ impl M2dirCoroutine for M2dirMailboxList {
 
                 if next_pending.is_empty() {
                     trace!("found {} m2dirs", found.len());
-                    return M2dirCoroutineState::Done(found);
+                    return M2dirCoroutineState::Complete(Ok(found));
                 }
 
                 let batch = next_pending;
@@ -173,11 +154,11 @@ impl M2dirCoroutine for M2dirMailboxList {
                     pending: BTreeSet::new(),
                     found,
                 };
-                M2dirCoroutineState::WantsDirRead(batch)
+                M2dirCoroutineState::Yielded(M2dirYield::WantsDirRead(batch))
             }
             (state, arg) => {
                 let err = M2dirMailboxListError::Invalid(arg, state);
-                M2dirCoroutineState::Err(err)
+                M2dirCoroutineState::Complete(Err(err))
             }
         }
     }

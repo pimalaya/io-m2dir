@@ -4,7 +4,7 @@
 use core::mem;
 
 use alloc::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     string::{String, ToString},
     vec::Vec,
 };
@@ -20,7 +20,7 @@ use crate::{
 #[derive(Clone, Debug, Error)]
 pub enum M2dirMessageDeleteError {
     #[error("Invalid m2dir message delete arg {0:?} for state {1:?}")]
-    Invalid(Option<M2dirMessageDeleteArg>, State),
+    Invalid(Option<M2dirArg>, State),
     #[error("entry {0} not found in m2dir")]
     NotFound(String),
     #[error(transparent)]
@@ -35,17 +35,6 @@ pub enum State {
     Removing,
     #[default]
     Invalid,
-}
-
-/// Argument fed back into [`M2dirMessageDelete`].
-#[derive(Clone, Debug)]
-pub enum M2dirMessageDeleteArg {
-    /// Response to [`M2dirCoroutineState::WantsDirRead`].
-    DirRead(BTreeMap<M2dirPath, BTreeSet<M2dirPath>>),
-    /// Response to [`M2dirCoroutineState::WantsFileExists`].
-    FileExists(BTreeMap<M2dirPath, bool>),
-    /// Response to [`M2dirCoroutineState::WantsFileRemove`].
-    FileRemove,
 }
 
 /// I/O-free coroutine to delete an entry from an m2dir.
@@ -72,54 +61,33 @@ impl M2dirMessageDelete {
 }
 
 impl M2dirCoroutine for M2dirMessageDelete {
-    type Arg = M2dirMessageDeleteArg;
-    type Output = ();
-    type Error = M2dirMessageDeleteError;
+    type Yield = M2dirYield;
+    type Return = Result<(), M2dirMessageDeleteError>;
 
-    fn resume(&mut self, arg: Option<Self::Arg>) -> M2dirCoroutineState<Self::Output, Self::Error> {
+    fn resume(&mut self, arg: Option<M2dirArg>) -> M2dirCoroutineState<Self::Yield, Self::Return> {
         match (mem::take(&mut self.state), arg) {
-            (State::List(mut list), arg) => {
-                let list_arg = match arg {
-                    None => None,
-                    Some(M2dirMessageDeleteArg::DirRead(entries)) => {
-                        Some(M2dirMessageListArg::DirRead(entries))
-                    }
-                    Some(M2dirMessageDeleteArg::FileExists(probes)) => {
-                        Some(M2dirMessageListArg::FileExists(probes))
-                    }
-                    Some(other) => {
-                        let state = State::List(list);
-                        let err = M2dirMessageDeleteError::Invalid(Some(other), state);
-                        return M2dirCoroutineState::Err(err);
-                    }
-                };
-
-                match list.resume(list_arg) {
-                    M2dirCoroutineState::WantsDirRead(paths) => {
-                        self.state = State::List(list);
-                        M2dirCoroutineState::WantsDirRead(paths)
-                    }
-                    M2dirCoroutineState::WantsFileExists(paths) => {
-                        self.state = State::List(list);
-                        M2dirCoroutineState::WantsFileExists(paths)
-                    }
-                    M2dirCoroutineState::Done(entries) => {
-                        let Some(entry) = entries.into_iter().find(|e| e.id() == self.id) else {
-                            let err = M2dirMessageDeleteError::NotFound(self.id.clone());
-                            return M2dirCoroutineState::Err(err);
-                        };
-
-                        trace!("located entry at {}", entry.path());
-
-                        let paths = BTreeSet::from_iter([self.meta_dir.clone()]);
-                        self.state = State::ReadMeta(entry);
-                        M2dirCoroutineState::WantsDirRead(paths)
-                    }
-                    M2dirCoroutineState::Err(err) => M2dirCoroutineState::Err(err.into()),
-                    other => unreachable!("M2dirMessageList yielded {other:?}"),
+            (State::List(mut list), arg) => match list.resume(arg) {
+                M2dirCoroutineState::Yielded(yld) => {
+                    self.state = State::List(list);
+                    M2dirCoroutineState::Yielded(yld)
                 }
-            }
-            (State::ReadMeta(entry), Some(M2dirMessageDeleteArg::DirRead(entries))) => {
+                M2dirCoroutineState::Complete(Ok(entries)) => {
+                    let Some(entry) = entries.into_iter().find(|e| e.id() == self.id) else {
+                        let err = M2dirMessageDeleteError::NotFound(self.id.clone());
+                        return M2dirCoroutineState::Complete(Err(err));
+                    };
+
+                    trace!("located entry at {}", entry.path());
+
+                    let paths = BTreeSet::from_iter([self.meta_dir.clone()]);
+                    self.state = State::ReadMeta(entry);
+                    M2dirCoroutineState::Yielded(M2dirYield::WantsDirRead(paths))
+                }
+                M2dirCoroutineState::Complete(Err(err)) => {
+                    M2dirCoroutineState::Complete(Err(err.into()))
+                }
+            },
+            (State::ReadMeta(entry), Some(M2dirArg::DirRead(entries))) => {
                 let meta_names = entries.into_values().next().unwrap_or_default();
                 let mut to_remove: Vec<M2dirPath> = Vec::new();
 
@@ -137,15 +105,17 @@ impl M2dirCoroutine for M2dirMessageDelete {
                 trace!("wants removal of {} files", to_remove.len());
 
                 self.state = State::Removing;
-                M2dirCoroutineState::WantsFileRemove(BTreeSet::from_iter(to_remove))
+                M2dirCoroutineState::Yielded(M2dirYield::WantsFileRemove(BTreeSet::from_iter(
+                    to_remove,
+                )))
             }
-            (State::Removing, Some(M2dirMessageDeleteArg::FileRemove)) => {
+            (State::Removing, Some(M2dirArg::FileRemove)) => {
                 trace!("entry deleted");
-                M2dirCoroutineState::Done(())
+                M2dirCoroutineState::Complete(Ok(()))
             }
             (state, arg) => {
                 let err = M2dirMessageDeleteError::Invalid(arg, state);
-                M2dirCoroutineState::Err(err)
+                M2dirCoroutineState::Complete(Err(err))
             }
         }
     }

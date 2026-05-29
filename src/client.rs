@@ -1,9 +1,11 @@
-//! Standard, blocking m2dir client.
+//! # Standard, blocking m2dir client
 //!
-//! Holds a single filesystem root and exposes one method per
+//! Holds a single filesystem root and exposes one method per common
 //! coroutine. Every method runs its coroutine to completion through
-//! [`M2dirClient::run`] by performing the requested filesystem
-//! operations via [`std::fs`].
+//! [`M2dirClient::run`] by servicing each [`M2dirYield`] request via
+//! [`std::fs`].
+//!
+//! [`M2dirYield`]: crate::coroutine::M2dirYield
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
@@ -92,23 +94,55 @@ impl M2dirClient {
         &self.root
     }
 
-    /// Drives any [`M2dirCoroutine`] to completion. The `handler`
-    /// closure receives each non-terminal [`M2dirCoroutineState`]
-    /// variant and returns the [`Arg`](M2dirCoroutine::Arg) to feed
-    /// back. Variants the coroutine never emits can be matched with
-    /// an `unreachable!()` arm.
-    pub fn run<C, F>(&self, mut coroutine: C, mut handler: F) -> Result<C::Output, M2dirClientError>
+    /// Drives any standard-shape coroutine (`Yield = M2dirYield`,
+    /// `Return = Result<Output, Error>`) against the local
+    /// filesystem until it terminates.
+    pub fn run<C, T, E>(&self, mut coroutine: C) -> Result<T, M2dirClientError>
     where
-        C: M2dirCoroutine,
-        M2dirClientError: From<C::Error>,
-        F: FnMut(M2dirCoroutineState<C::Output, C::Error>) -> Result<C::Arg, M2dirClientError>,
+        C: M2dirCoroutine<Yield = M2dirYield, Return = Result<T, E>>,
+        M2dirClientError: From<E>,
     {
-        let mut arg: Option<C::Arg> = None;
+        let mut arg: Option<M2dirArg> = None;
+
         loop {
             match coroutine.resume(arg.take()) {
-                M2dirCoroutineState::Done(out) => return Ok(out),
-                M2dirCoroutineState::Err(err) => return Err(err.into()),
-                other => arg = Some(handler(other)?),
+                M2dirCoroutineState::Complete(Ok(out)) => return Ok(out),
+                M2dirCoroutineState::Complete(Err(err)) => return Err(err.into()),
+                M2dirCoroutineState::Yielded(M2dirYield::WantsPid) => {
+                    arg = Some(M2dirArg::Pid(process::id()));
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsRandom { len }) => {
+                    arg = Some(M2dirArg::Random(random_bytes(len)));
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsFileExists(paths)) => {
+                    arg = Some(M2dirArg::FileExists(file_exists(paths)));
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsDirRead(paths)) => {
+                    arg = Some(M2dirArg::DirRead(read_dirs(paths)?));
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsDirCreate(paths)) => {
+                    create_dirs(paths)?;
+                    arg = Some(M2dirArg::DirCreate);
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsDirRemove(paths)) => {
+                    remove_dirs(paths)?;
+                    arg = Some(M2dirArg::DirRemove);
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsFileRead(paths)) => {
+                    arg = Some(M2dirArg::FileRead(read_files_tolerant(paths)?));
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsFileCreate(files)) => {
+                    write_files(files)?;
+                    arg = Some(M2dirArg::FileCreate);
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsFileRemove(paths)) => {
+                    remove_files_tolerant(paths)?;
+                    arg = Some(M2dirArg::FileRemove);
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsRename(pairs)) => {
+                    rename_paths(pairs)?;
+                    arg = Some(M2dirArg::Rename);
+                }
             }
         }
     }
@@ -146,57 +180,25 @@ impl M2dirClient {
     pub fn create_mailbox(&self, name: &str) -> Result<M2dir, M2dirClientError> {
         let store = self.open_store()?;
         let coroutine = M2dirMailboxCreate::new(&store, name)?;
-        self.run(coroutine, |state| match state {
-            M2dirCoroutineState::WantsDirCreate(paths) => {
-                create_dirs(paths)?;
-                Ok(M2dirMailboxCreateArg::DirCreate)
-            }
-            M2dirCoroutineState::WantsFileCreate(files) => {
-                write_files(files)?;
-                Ok(M2dirMailboxCreateArg::FileCreate)
-            }
-            other => unreachable!("M2dirMailboxCreate yielded {other:?}"),
-        })
+        self.run(coroutine)
     }
 
     /// Recursively removes the m2dir at `path`.
     pub fn delete_mailbox(&self, path: impl Into<M2dirPath>) -> Result<(), M2dirClientError> {
-        self.run(M2dirMailboxDelete::new(path), |state| match state {
-            M2dirCoroutineState::WantsDirRemove(paths) => {
-                remove_dirs(paths)?;
-                Ok(M2dirMailboxDeleteArg::DirRemove)
-            }
-            other => unreachable!("M2dirMailboxDelete yielded {other:?}"),
-        })
+        self.run(M2dirMailboxDelete::new(path))
     }
 
     /// Lists every m2dir under the store root.
     pub fn list_mailboxes(&self) -> Result<BTreeSet<M2dir>, M2dirClientError> {
         let store = self.open_store()?;
-        self.run(M2dirMailboxList::new(&store), |state| match state {
-            M2dirCoroutineState::WantsDirRead(paths) => {
-                Ok(M2dirMailboxListArg::DirRead(read_dirs(paths)?))
-            }
-            M2dirCoroutineState::WantsFileExists(paths) => {
-                Ok(M2dirMailboxListArg::FileExists(file_exists(paths)))
-            }
-            other => unreachable!("M2dirMailboxList yielded {other:?}"),
-        })
+        self.run(M2dirMailboxList::new(&store))
     }
 
     // ---- Messages -----------------------------------------------
 
     /// Lists every entry inside `m2dir`.
     pub fn list_entries(&self, m2dir: M2dir) -> Result<Vec<M2dirEntry>, M2dirClientError> {
-        self.run(M2dirMessageList::new(m2dir), |state| match state {
-            M2dirCoroutineState::WantsDirRead(paths) => {
-                Ok(M2dirMessageListArg::DirRead(read_dirs(paths)?))
-            }
-            M2dirCoroutineState::WantsFileExists(paths) => {
-                Ok(M2dirMessageListArg::FileExists(file_exists(paths)))
-            }
-            other => unreachable!("M2dirMessageList yielded {other:?}"),
-        })
+        self.run(M2dirMessageList::new(m2dir))
     }
 
     /// Reads the file backing `entry` and validates its checksum.
@@ -304,57 +306,20 @@ impl M2dirClient {
         m2dir: M2dir,
         id: impl ToString,
     ) -> Result<(M2dirEntry, Vec<u8>), M2dirClientError> {
-        let M2dirMessageGetOk { entry, contents } =
-            self.run(M2dirMessageGet::new(m2dir, id), |state| match state {
-                M2dirCoroutineState::WantsDirRead(paths) => {
-                    Ok(M2dirMessageGetArg::DirRead(read_dirs(paths)?))
-                }
-                M2dirCoroutineState::WantsFileExists(paths) => {
-                    Ok(M2dirMessageGetArg::FileExists(file_exists(paths)))
-                }
-                M2dirCoroutineState::WantsFileRead(paths) => {
-                    Ok(M2dirMessageGetArg::FileRead(read_files(paths)?))
-                }
-                other => unreachable!("M2dirMessageGet yielded {other:?}"),
-            })?;
+        let M2dirMessageGetOutput { entry, contents } =
+            self.run(M2dirMessageGet::new(m2dir, id))?;
         Ok((entry, contents))
     }
 
     /// Writes `bytes` to a temporary file inside `m2dir`, then
     /// atomically renames it to its checksum-based final filename.
     pub fn store(&self, m2dir: M2dir, bytes: Vec<u8>) -> Result<M2dirEntry, M2dirClientError> {
-        self.run(M2dirMessageStore::new(m2dir, bytes), |state| match state {
-            M2dirCoroutineState::WantsPid => Ok(M2dirMessageStoreArg::Pid(process::id())),
-            M2dirCoroutineState::WantsRandom { len } => {
-                Ok(M2dirMessageStoreArg::Random(random_bytes(len)))
-            }
-            M2dirCoroutineState::WantsFileCreate(files) => {
-                write_files(files)?;
-                Ok(M2dirMessageStoreArg::FileCreate)
-            }
-            M2dirCoroutineState::WantsRename(pairs) => {
-                rename_paths(pairs)?;
-                Ok(M2dirMessageStoreArg::Rename)
-            }
-            other => unreachable!("M2dirMessageStore yielded {other:?}"),
-        })
+        self.run(M2dirMessageStore::new(m2dir, bytes))
     }
 
     /// Removes entry `id` and every matching `.meta/<id>*` file.
     pub fn delete_message(&self, m2dir: M2dir, id: impl ToString) -> Result<(), M2dirClientError> {
-        self.run(M2dirMessageDelete::new(m2dir, id), |state| match state {
-            M2dirCoroutineState::WantsDirRead(paths) => {
-                Ok(M2dirMessageDeleteArg::DirRead(read_dirs(paths)?))
-            }
-            M2dirCoroutineState::WantsFileExists(paths) => {
-                Ok(M2dirMessageDeleteArg::FileExists(file_exists(paths)))
-            }
-            M2dirCoroutineState::WantsFileRemove(paths) => {
-                remove_files(paths)?;
-                Ok(M2dirMessageDeleteArg::FileRemove)
-            }
-            other => unreachable!("M2dirMessageDelete yielded {other:?}"),
-        })
+        self.run(M2dirMessageDelete::new(m2dir, id))
     }
 
     // ---- Flags --------------------------------------------------
@@ -383,16 +348,7 @@ impl M2dirClient {
         id: impl AsRef<str>,
         flags: M2dirFlags,
     ) -> Result<(), M2dirClientError> {
-        self.run(M2dirFlagAdd::new(m2dir, id, flags), |state| match state {
-            M2dirCoroutineState::WantsFileRead(paths) => {
-                Ok(M2dirFlagAddArg::FileRead(read_files_tolerant(paths)?))
-            }
-            M2dirCoroutineState::WantsFileCreate(files) => {
-                write_files(files)?;
-                Ok(M2dirFlagAddArg::FileCreate)
-            }
-            other => unreachable!("M2dirFlagAdd yielded {other:?}"),
-        })
+        self.run(M2dirFlagAdd::new(m2dir, id, flags))
     }
 
     /// Removes `flags` from entry `id`'s flags metadata file. When
@@ -403,44 +359,18 @@ impl M2dirClient {
         id: impl AsRef<str>,
         flags: M2dirFlags,
     ) -> Result<(), M2dirClientError> {
-        self.run(
-            M2dirFlagRemove::new(m2dir, id, flags),
-            |state| match state {
-                M2dirCoroutineState::WantsFileRead(paths) => {
-                    Ok(M2dirFlagRemoveArg::FileRead(read_files_tolerant(paths)?))
-                }
-                M2dirCoroutineState::WantsFileCreate(files) => {
-                    write_files(files)?;
-                    Ok(M2dirFlagRemoveArg::FileCreate)
-                }
-                M2dirCoroutineState::WantsFileRemove(paths) => {
-                    remove_files(paths)?;
-                    Ok(M2dirFlagRemoveArg::FileRemove)
-                }
-                other => unreachable!("M2dirFlagRemove yielded {other:?}"),
-            },
-        )
+        self.run(M2dirFlagRemove::new(m2dir, id, flags))
     }
 
-    /// Replaces entry `id`'s flags metadata file with `flags`, deleting it when
-    /// `flags` is empty.
+    /// Replaces entry `id`'s flags metadata file with `flags`,
+    /// deleting it when `flags` is empty.
     pub fn set_flags(
         &self,
         m2dir: &M2dir,
         id: impl AsRef<str>,
         flags: M2dirFlags,
     ) -> Result<(), M2dirClientError> {
-        self.run(M2dirFlagSet::new(m2dir, id, flags), |state| match state {
-            M2dirCoroutineState::WantsFileCreate(files) => {
-                write_files(files)?;
-                Ok(M2dirFlagSetArg::FileCreate)
-            }
-            M2dirCoroutineState::WantsFileRemove(paths) => {
-                remove_files_tolerant(paths)?;
-                Ok(M2dirFlagSetArg::FileRemove)
-            }
-            other => unreachable!("M2dirFlagSet yielded {other:?}"),
-        })
+        self.run(M2dirFlagSet::new(m2dir, id, flags))
     }
 }
 
@@ -511,14 +441,6 @@ fn write_files(files: BTreeMap<M2dirPath, Vec<u8>>) -> Result<(), io::Error> {
     Ok(())
 }
 
-fn remove_files(paths: BTreeSet<M2dirPath>) -> Result<(), io::Error> {
-    for path in paths {
-        trace!("remove_file {path}");
-        fs::remove_file(path.as_str())?;
-    }
-    Ok(())
-}
-
 fn remove_files_tolerant(paths: BTreeSet<M2dirPath>) -> Result<(), io::Error> {
     for path in paths {
         trace!("remove_file (tolerant) {path}");
@@ -556,18 +478,6 @@ fn read_dirs(
     }
 
     Ok(entries)
-}
-
-fn read_files(paths: BTreeSet<M2dirPath>) -> Result<BTreeMap<M2dirPath, Vec<u8>>, io::Error> {
-    let mut contents = BTreeMap::new();
-
-    for path in paths {
-        trace!("read_file {path}");
-        let bytes = fs::read(path.as_str())?;
-        contents.insert(path, bytes);
-    }
-
-    Ok(contents)
 }
 
 fn read_files_tolerant(

@@ -17,7 +17,7 @@ use crate::{coroutine::*, entry::M2dirEntry, m2dir::M2dir, path::M2dirPath};
 #[derive(Clone, Debug, Error)]
 pub enum M2dirMessageListError {
     #[error("Invalid m2dir message list arg {0:?} for state {1:?}")]
-    Invalid(Option<M2dirMessageListArg>, State),
+    Invalid(Option<M2dirArg>, State),
 }
 
 /// Internal progression state of [`M2dirMessageList`].
@@ -30,15 +30,6 @@ pub enum State {
     },
     #[default]
     Invalid,
-}
-
-/// Argument fed back into [`M2dirMessageList`].
-#[derive(Clone, Debug)]
-pub enum M2dirMessageListArg {
-    /// Response to [`M2dirCoroutineState::WantsDirRead`].
-    DirRead(BTreeMap<M2dirPath, BTreeSet<M2dirPath>>),
-    /// Response to [`M2dirCoroutineState::WantsFileExists`].
-    FileExists(BTreeMap<M2dirPath, bool>),
 }
 
 /// I/O-free coroutine to list every entry inside an [`M2dir`].
@@ -64,20 +55,19 @@ impl M2dirMessageList {
 }
 
 impl M2dirCoroutine for M2dirMessageList {
-    type Arg = M2dirMessageListArg;
-    type Output = Vec<M2dirEntry>;
-    type Error = M2dirMessageListError;
+    type Yield = M2dirYield;
+    type Return = Result<Vec<M2dirEntry>, M2dirMessageListError>;
 
-    fn resume(&mut self, arg: Option<Self::Arg>) -> M2dirCoroutineState<Self::Output, Self::Error> {
+    fn resume(&mut self, arg: Option<M2dirArg>) -> M2dirCoroutineState<Self::Yield, Self::Return> {
         match (mem::take(&mut self.state), arg) {
             (State::Start(m2dir), None) => {
                 trace!("wants directory read of {}", m2dir.path());
 
                 let paths = BTreeSet::from_iter([m2dir.path().clone()]);
                 self.state = State::Reading;
-                M2dirCoroutineState::WantsDirRead(paths)
+                M2dirCoroutineState::Yielded(M2dirYield::WantsDirRead(paths))
             }
-            (State::Reading, Some(M2dirMessageListArg::DirRead(entries))) => {
+            (State::Reading, Some(M2dirArg::DirRead(entries))) => {
                 let mut candidates = BTreeMap::new();
 
                 for (_dir, names) in entries {
@@ -101,16 +91,16 @@ impl M2dirCoroutine for M2dirMessageList {
 
                 if candidates.is_empty() {
                     trace!("no candidate entries");
-                    return M2dirCoroutineState::Done(Vec::new());
+                    return M2dirCoroutineState::Complete(Ok(Vec::new()));
                 }
 
                 let probes: BTreeSet<M2dirPath> = candidates.keys().cloned().collect();
                 trace!("wants existence check for {} candidates", probes.len());
 
                 self.state = State::Checking { candidates };
-                M2dirCoroutineState::WantsFileExists(probes)
+                M2dirCoroutineState::Yielded(M2dirYield::WantsFileExists(probes))
             }
-            (State::Checking { candidates }, Some(M2dirMessageListArg::FileExists(probes))) => {
+            (State::Checking { candidates }, Some(M2dirArg::FileExists(probes))) => {
                 let mut found = Vec::new();
 
                 for (path, id) in candidates {
@@ -120,11 +110,11 @@ impl M2dirCoroutine for M2dirMessageList {
                 }
 
                 trace!("found {} entries", found.len());
-                M2dirCoroutineState::Done(found)
+                M2dirCoroutineState::Complete(Ok(found))
             }
             (state, arg) => {
                 let err = M2dirMessageListError::Invalid(arg, state);
-                M2dirCoroutineState::Err(err)
+                M2dirCoroutineState::Complete(Err(err))
             }
         }
     }

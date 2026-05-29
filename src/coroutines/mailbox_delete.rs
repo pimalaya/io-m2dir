@@ -11,15 +11,7 @@ use crate::{coroutine::*, path::M2dirPath};
 #[derive(Clone, Debug, Error)]
 pub enum M2dirMailboxDeleteError {
     #[error("Invalid m2dir mailbox delete arg: {0:?}")]
-    Invalid(Option<M2dirMailboxDeleteArg>),
-}
-
-/// Argument fed back into [`M2dirMailboxDelete`] after the caller
-/// performed the requested filesystem operation.
-#[derive(Clone, Debug)]
-pub enum M2dirMailboxDeleteArg {
-    /// Response to [`M2dirCoroutineState::WantsDirRemove`].
-    DirRemove,
+    Invalid(Option<M2dirArg>),
 }
 
 /// I/O-free coroutine to delete an m2dir mailbox and all its
@@ -41,23 +33,22 @@ impl M2dirMailboxDelete {
 }
 
 impl M2dirCoroutine for M2dirMailboxDelete {
-    type Arg = M2dirMailboxDeleteArg;
-    type Output = ();
-    type Error = M2dirMailboxDeleteError;
+    type Yield = M2dirYield;
+    type Return = Result<(), M2dirMailboxDeleteError>;
 
-    fn resume(&mut self, arg: Option<Self::Arg>) -> M2dirCoroutineState<Self::Output, Self::Error> {
+    fn resume(&mut self, arg: Option<M2dirArg>) -> M2dirCoroutineState<Self::Yield, Self::Return> {
         match (self.wants_dir_remove.take(), arg) {
             (Some(paths), None) => {
                 trace!("wants filesystem I/O to remove {} directories", paths.len());
-                M2dirCoroutineState::WantsDirRemove(paths)
+                M2dirCoroutineState::Yielded(M2dirYield::WantsDirRemove(paths))
             }
-            (None, Some(M2dirMailboxDeleteArg::DirRemove)) => {
+            (None, Some(M2dirArg::DirRemove)) => {
                 trace!("resume after removing m2dir");
-                M2dirCoroutineState::Done(())
+                M2dirCoroutineState::Complete(Ok(()))
             }
             (_, arg) => {
                 let err = M2dirMailboxDeleteError::Invalid(arg);
-                M2dirCoroutineState::Err(err)
+                M2dirCoroutineState::Complete(Err(err))
             }
         }
     }

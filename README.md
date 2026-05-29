@@ -52,12 +52,10 @@ This library implements the [m2dir](https://man.sr.ht/~bitfehler/m2dir/) mail st
 
 I/O m2dir can be consumed two ways, depending on how much of the I/O stack you want to own. Each mode is gated by cargo features.
 
-Whichever mode you pick, every coroutine implements the `M2dirCoroutine` trait. Its `resume(arg: Option<Arg>)` method returns `M2dirCoroutineState<Output, Error>` with three terminal shapes plus filesystem (and environment) request variants:
+Whichever mode you pick, every coroutine implements the `M2dirCoroutine` trait. Its `resume(arg: Option<M2dirArg>)` method returns a `M2dirCoroutineState<Yield, Return>` with two variants:
 
-- `WantsPid`, `WantsRandom { len }`: caller supplies the current process id or `len` random bytes. Used by the message-store coroutine to mint nonces.
-- `WantsDirCreate`, `WantsDirRead`, `WantsDirRemove`, `WantsFileCreate`, `WantsFileRead`, `WantsFileExists`, `WantsFileRemove`, `WantsRename`: caller performs the matching filesystem operation and feeds back the corresponding `Arg::*` variant.
-- `Done(Output)`: terminal success carrying the coroutine's `Output` payload.
-- `Err(Error)`: terminal failure.
+- `Yielded(Y)`: intermediate. `Y` is the per-coroutine yield type; every io-m2dir coroutine picks the standard `M2dirYield`, whose variants are `WantsPid`, `WantsRandom { len }`, `WantsDirCreate`, `WantsDirRead`, `WantsDirRemove`, `WantsFileCreate`, `WantsFileRead`, `WantsFileExists`, `WantsFileRemove`, `WantsRename`. The driver services the request and feeds back the matching `M2dirArg` variant on the next `resume`.
+- `Complete(R)`: terminal. By convention `R = Result<Output, Error>` carrying the operation's final value.
 
 ### I/O-free coroutines
 
@@ -79,15 +77,16 @@ let m2dir = M2dir::from_path(M2dirPath::new("/path/to/m2dir/inbox"));
 let bytes = b"From: alice@example.com\r\nSubject: Hello\r\n\r\nHello!\r\n".to_vec();
 
 let mut coroutine = M2dirMessageStore::new(m2dir, bytes);
-let mut arg: Option<M2dirMessageStoreArg> = None;
+let mut arg: Option<M2dirArg> = None;
 
 let entry = loop {
     match coroutine.resume(arg.take()) {
-        M2dirCoroutineState::Done(entry) => break entry,
-        M2dirCoroutineState::WantsPid => {
-            arg = Some(M2dirMessageStoreArg::Pid(process::id()));
+        M2dirCoroutineState::Complete(Ok(entry)) => break entry,
+        M2dirCoroutineState::Complete(Err(err)) => panic!("{err}"),
+        M2dirCoroutineState::Yielded(M2dirYield::WantsPid) => {
+            arg = Some(M2dirArg::Pid(process::id()));
         }
-        M2dirCoroutineState::WantsRandom { len } => {
+        M2dirCoroutineState::Yielded(M2dirYield::WantsRandom { len }) => {
             // Replace with a stronger RNG if needed; the std client
             // ships a xorshift64* helper seeded from RandomState.
             let mut out = vec![0u8; len];
@@ -98,22 +97,21 @@ let entry = loop {
                 state ^= state << 17;
                 *byte = state as u8;
             }
-            arg = Some(M2dirMessageStoreArg::Random(out));
+            arg = Some(M2dirArg::Random(out));
         }
-        M2dirCoroutineState::WantsFileCreate(files) => {
+        M2dirCoroutineState::Yielded(M2dirYield::WantsFileCreate(files)) => {
             for (path, bytes) in files {
                 fs::write(path.as_str(), &bytes).unwrap();
             }
-            arg = Some(M2dirMessageStoreArg::FileCreate);
+            arg = Some(M2dirArg::FileCreate);
         }
-        M2dirCoroutineState::WantsRename(pairs) => {
+        M2dirCoroutineState::Yielded(M2dirYield::WantsRename(pairs)) => {
             for (from, to) in pairs {
                 fs::rename(from.as_str(), to.as_str()).unwrap();
             }
-            arg = Some(M2dirMessageStoreArg::Rename);
+            arg = Some(M2dirArg::Rename);
         }
-        M2dirCoroutineState::Err(err) => panic!("{err}"),
-        other => unreachable!("M2dirMessageStore yielded {other:?}"),
+        M2dirCoroutineState::Yielded(other) => unreachable!("M2dirMessageStore yielded {other:?}"),
     }
 };
 
@@ -173,7 +171,7 @@ AI-generated code; the code is adjusted to fit correct behaviour.
 but nonexistent APIs, stale spec references. The verification workflow catches most of this; it does not catch all of it. Bug reports are welcome and taken
 seriously.
 
-- **Last reviewed**: 29/05/2026
+- **Last reviewed**: 30/05/2026
 
 ## License
 
