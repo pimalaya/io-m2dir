@@ -2,12 +2,15 @@
 
 use alloc::string::{String, ToString};
 
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use thiserror::Error;
 
-use crate::{
-    path::M2dirPath,
-    percent::{percent_decode_bytes, percent_encode_bytes},
-};
+use crate::path::M2dirPath;
+
+/// Bytes percent-encoded by m2dir folder names: the path separators
+/// (`/`, `\`), the escape char (`%`), plus all control bytes; non-ASCII
+/// codepoints are always encoded by `utf8_percent_encode`.
+const M2DIR_PCT: &AsciiSet = &CONTROLS.add(b'%').add(b'/').add(b'\\');
 
 /// Marker filename written at the root of every m2store.
 pub const DOT_M2STORE: &str = ".m2store";
@@ -18,7 +21,7 @@ pub const DOT_DELIVERY: &str = ".delivery";
 
 /// Errors that can occur while opening an existing m2store.
 #[derive(Clone, Debug, Error)]
-pub enum LoadM2storeError {
+pub enum LoadM2dirStoreError {
     /// The given path is not a directory.
     #[error("path {0} is not a directory")]
     NotDir(M2dirPath),
@@ -40,14 +43,14 @@ pub enum NewFolderError {
     EscapesRoot(String),
 }
 
-/// Root m2store directory holding one or more [`crate::m2dir::M2dir`]s.
+/// Root m2store directory holding one or more [`crate::m2dir::types::M2dir`]s.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct M2store {
+pub struct M2dirStore {
     path: M2dirPath,
 }
 
-impl M2store {
-    /// Builds an [`M2store`] from a path without checking the marker.
+impl M2dirStore {
+    /// Builds an [`M2dirStore`] from a path without checking the marker.
     pub fn from_path(path: impl Into<M2dirPath>) -> Self {
         Self { path: path.into() }
     }
@@ -87,9 +90,7 @@ impl M2store {
                     return Err(NewFolderError::EscapesRoot(name.to_string()));
                 }
                 part => {
-                    let mut encoded = String::new();
-                    percent_encode_bytes(part.as_bytes(), &mut encoded)
-                        .expect("percent encoding to a string is always valid");
+                    let encoded = utf8_percent_encode(part, M2DIR_PCT).to_string();
                     resolved.push(&encoded);
                 }
             }
@@ -101,23 +102,26 @@ impl M2store {
     /// Decodes a path inside the store back to its UTF-8 folder name.
     pub fn decode_folder_name(&self, path: &M2dirPath) -> Option<String> {
         let rel = path.strip_prefix(&self.path)?;
-        percent_decode_bytes(rel.bytes()).ok()
+        percent_decode_str(rel)
+            .decode_utf8()
+            .ok()
+            .map(|s| s.into_owned())
     }
 }
 
-impl AsRef<M2dirPath> for M2store {
+impl AsRef<M2dirPath> for M2dirStore {
     fn as_ref(&self) -> &M2dirPath {
         &self.path
     }
 }
 
-impl AsRef<str> for M2store {
+impl AsRef<str> for M2dirStore {
     fn as_ref(&self) -> &str {
         self.path.as_str()
     }
 }
 
-impl From<M2dirPath> for M2store {
+impl From<M2dirPath> for M2dirStore {
     fn from(path: M2dirPath) -> Self {
         Self { path }
     }

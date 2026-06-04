@@ -37,13 +37,13 @@ This library implements the [m2dir](https://man.sr.ht/~bitfehler/m2dir/) mail st
 
 | Coroutine             | What it does                                                                                  |
 |-----------------------|-----------------------------------------------------------------------------------------------|
-| `M2dirMailboxCreate`  | Creates an m2dir folder, its `.meta` sub-directory and the `.m2dir` marker file               |
-| `M2dirMailboxDelete`  | Recursively removes an m2dir mailbox                                                          |
-| `M2dirMailboxList`    | Walks the m2store tree and surfaces every directory carrying a `.m2dir` marker                |
-| `M2dirMessageStore`   | Writes a temporary file, then atomically renames to `<date>,<checksum>.<nonce>`               |
-| `M2dirMessageGet`     | Locates an entry by id, reads its contents and validates the checksum                         |
-| `M2dirMessageList`    | Lists every confirmed entry inside an m2dir                                                   |
-| `M2dirMessageDelete`  | Removes a message file and every sibling `.meta/<id>*` file                                   |
+| `M2dirCreate`         | Creates an m2dir folder, its `.meta` sub-directory and the `.m2dir` marker file               |
+| `M2dirDelete`         | Recursively removes an m2dir                                                                  |
+| `M2dirList`           | Walks the m2store tree and surfaces every directory carrying a `.m2dir` marker                |
+| `M2dirEntryStore`     | Writes a temporary file, then atomically renames to `<date>,<checksum>.<nonce>`               |
+| `M2dirEntryGet`       | Locates an entry by id, reads its contents and validates the checksum                         |
+| `M2dirEntryList`      | Lists every confirmed entry inside an m2dir                                                   |
+| `M2dirEntryDelete`    | Removes an entry file and every sibling `.meta/<id>*` file                                    |
 | `M2dirFlagAdd`        | Merges flags into an entry's `.meta/<id>.flags` sidecar                                       |
 | `M2dirFlagRemove`     | Removes flags from an entry's `.meta/<id>.flags` sidecar (deletes the file when empty)        |
 | `M2dirFlagSet`        | Replaces an entry's `.meta/<id>.flags` sidecar (deletes the file when the new set is empty)   |
@@ -61,22 +61,22 @@ Whichever mode you pick, every coroutine implements the `M2dirCoroutine` trait. 
 
 No features required: works in `#![no_std]`, no filesystem calls, no async runtime. You own the loop and the syscalls; the library only computes the operations to perform and consumes their results.
 
-Drive a multi-step command (store a message) against a blocking caller (the same shape works under async or in-memory replay):
+Drive a multi-step command (store an entry) against a blocking caller (the same shape works under async or in-memory replay):
 
 ```rust,ignore
 use std::{collections::hash_map::RandomState, fs, hash::{BuildHasher, Hasher}, process};
 
 use io_m2dir::{
     coroutine::*,
-    coroutines::message_store::*,
-    m2dir::M2dir,
+    entry::store::*,
+    m2dir::types::M2dir,
     path::M2dirPath,
 };
 
 let m2dir = M2dir::from_path(M2dirPath::new("/path/to/m2dir/inbox"));
 let bytes = b"From: alice@example.com\r\nSubject: Hello\r\n\r\nHello!\r\n".to_vec();
 
-let mut coroutine = M2dirMessageStore::new(m2dir, bytes);
+let mut coroutine = M2dirEntryStore::new(m2dir, bytes, M2dirEntryStoreOptions::default());
 let mut arg: Option<M2dirArg> = None;
 
 let entry = loop {
@@ -111,7 +111,7 @@ let entry = loop {
             }
             arg = Some(M2dirArg::Rename);
         }
-        M2dirCoroutineState::Yielded(other) => unreachable!("M2dirMessageStore yielded {other:?}"),
+        M2dirCoroutineState::Yielded(other) => unreachable!("M2dirEntryStore yielded {other:?}"),
     }
 };
 
@@ -128,12 +128,12 @@ io-m2dir = "0.0.1" # client is enabled by default
 ```
 
 ```rust,ignore
-use io_m2dir::{client::M2dirClient, flag::M2dirFlags};
+use io_m2dir::{client::M2dirClient, flag::types::M2dirFlags};
 
 let client = M2dirClient::new("/path/to/store");
 
 client.init_store()?;
-let inbox = client.create_mailbox("inbox")?;
+let inbox = client.create_m2dir("inbox")?;
 
 let bytes = b"From: alice@example.com\r\nSubject: Hello\r\n\r\nHello!\r\n".to_vec();
 let entry = client.store(inbox.clone(), bytes)?;

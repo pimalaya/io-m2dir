@@ -114,7 +114,7 @@ impl From<M2dirFlags> for BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::flag::*;
+    use crate::flag::types::*;
 
     #[test]
     fn meta_round_trip() {

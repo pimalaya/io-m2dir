@@ -7,18 +7,16 @@
 //!
 //! [`M2dirYield`]: crate::coroutine::M2dirYield
 
-use alloc::{
-    collections::{BTreeMap, BTreeSet},
-    string::ToString,
-    vec::Vec,
-};
 use std::{
-    collections::hash_map::RandomState,
+    collections::{BTreeMap, BTreeSet, hash_map::RandomState},
     fs,
     hash::{BuildHasher, Hasher},
     io,
     path::{Path, PathBuf},
-    process, thread,
+    process,
+    string::ToString,
+    thread,
+    vec::Vec,
 };
 
 use log::trace;
@@ -26,40 +24,48 @@ use thiserror::Error;
 
 use crate::{
     coroutine::*,
-    coroutines::{
-        flag_add::*, flag_remove::*, flag_set::*, mailbox_create::*, mailbox_delete::*,
-        mailbox_list::*, message_delete::*, message_get::*, message_list::*, message_store::*,
+    entry::{
+        delete::*,
+        get::*,
+        list::*,
+        store::*,
+        types::{M2dirEntry, M2dirFullEntry, ParseFilenameError, validate_checksum},
     },
-    entry::{M2dirEntry, M2dirFullEntry, ParseFilenameError, validate_checksum},
-    flag::M2dirFlags,
-    m2dir::{DOT_M2DIR, LoadM2dirError, M2dir},
-    m2store::{DOT_M2STORE, LoadM2storeError, M2store, NewFolderError},
+    flag::types::M2dirFlags,
+    flag::{add::*, remove::*, set::*},
+    m2dir::{
+        create::*,
+        delete::*,
+        list::*,
+        types::{DOT_M2DIR, LoadM2dirError, M2dir},
+    },
     path::M2dirPath,
+    store::{DOT_M2STORE, LoadM2dirStoreError, M2dirStore, NewFolderError},
 };
 
 /// Errors returned by [`M2dirClient`].
 #[derive(Debug, Error)]
 pub enum M2dirClientError {
     #[error(transparent)]
-    LoadM2store(#[from] LoadM2storeError),
+    LoadStore(#[from] LoadM2dirStoreError),
     #[error(transparent)]
     LoadM2dir(#[from] LoadM2dirError),
     #[error(transparent)]
     NewFolder(#[from] NewFolderError),
     #[error(transparent)]
-    CreateMailbox(#[from] M2dirMailboxCreateError),
+    CreateM2dir(#[from] M2dirCreateError),
     #[error(transparent)]
-    DeleteMailbox(#[from] M2dirMailboxDeleteError),
+    DeleteM2dir(#[from] M2dirDeleteError),
     #[error(transparent)]
-    ListMailboxes(#[from] M2dirMailboxListError),
+    ListM2dirs(#[from] M2dirListError),
     #[error(transparent)]
-    ListMessages(#[from] M2dirMessageListError),
+    ListEntries(#[from] M2dirEntryListError),
     #[error(transparent)]
-    GetMessage(#[from] M2dirMessageGetError),
+    GetEntry(#[from] M2dirEntryGetError),
     #[error(transparent)]
-    StoreMessage(#[from] M2dirMessageStoreError),
+    StoreEntry(#[from] M2dirEntryStoreError),
     #[error(transparent)]
-    DeleteMessage(#[from] M2dirMessageDeleteError),
+    DeleteEntry(#[from] M2dirEntryDeleteError),
     #[error(transparent)]
     AddFlags(#[from] M2dirFlagAddError),
     #[error(transparent)]
@@ -75,7 +81,7 @@ pub enum M2dirClientError {
 /// Std-blocking m2dir client wrapping a filesystem root.
 ///
 /// The root must point to an m2store: a directory containing a
-/// `.m2store` marker. Mailbox helpers resolve folder names against
+/// `.m2store` marker. M2dir helpers resolve folder names against
 /// this root.
 #[derive(Debug)]
 pub struct M2dirClient {
@@ -149,13 +155,13 @@ impl M2dirClient {
 
     /// Opens the m2store at the client root, returning a typed
     /// handle on success.
-    pub fn open_store(&self) -> Result<M2store, M2dirClientError> {
-        load_m2store(self.root.clone()).map_err(Into::into)
+    pub fn open_store(&self) -> Result<M2dirStore, M2dirClientError> {
+        load_store(self.root.clone()).map_err(Into::into)
     }
 
     /// Initialises a brand new m2store at the client root: creates
     /// the directory if needed and writes the `.m2store` marker.
-    pub fn init_store(&self) -> Result<M2store, M2dirClientError> {
+    pub fn init_store(&self) -> Result<M2dirStore, M2dirClientError> {
         trace!("init m2store at {}", self.root);
 
         fs::create_dir_all(self.root.as_str())?;
@@ -164,7 +170,7 @@ impl M2dirClient {
             fs::write(marker.as_str(), b"")?;
         }
 
-        Ok(M2store::from_path(self.root.clone()))
+        Ok(M2dirStore::from_path(self.root.clone()))
     }
 
     /// Opens an existing m2dir at `path`, validating the `.m2dir`
@@ -173,32 +179,32 @@ impl M2dirClient {
         load_m2dir(path.into()).map_err(Into::into)
     }
 
-    // ---- Mailbox lifecycle --------------------------------------
+    // ---- M2dir lifecycle ----------------------------------------
 
     /// Creates the m2dir folder `name` and writes the `.m2dir`
     /// marker.
-    pub fn create_mailbox(&self, name: &str) -> Result<M2dir, M2dirClientError> {
+    pub fn create_m2dir(&self, name: &str) -> Result<M2dir, M2dirClientError> {
         let store = self.open_store()?;
-        let coroutine = M2dirMailboxCreate::new(&store, name)?;
+        let coroutine = M2dirCreate::new(&store, name, M2dirCreateOptions::default())?;
         self.run(coroutine)
     }
 
     /// Recursively removes the m2dir at `path`.
-    pub fn delete_mailbox(&self, path: impl Into<M2dirPath>) -> Result<(), M2dirClientError> {
-        self.run(M2dirMailboxDelete::new(path))
+    pub fn delete_m2dir(&self, path: impl Into<M2dirPath>) -> Result<(), M2dirClientError> {
+        self.run(M2dirDelete::new(path, M2dirDeleteOptions::default()))
     }
 
     /// Lists every m2dir under the store root.
-    pub fn list_mailboxes(&self) -> Result<BTreeSet<M2dir>, M2dirClientError> {
+    pub fn list_m2dirs(&self) -> Result<BTreeSet<M2dir>, M2dirClientError> {
         let store = self.open_store()?;
-        self.run(M2dirMailboxList::new(&store))
+        self.run(M2dirList::new(&store, M2dirListOptions::default()))
     }
 
-    // ---- Messages -----------------------------------------------
+    // ---- Entries ------------------------------------------------
 
     /// Lists every entry inside `m2dir`.
     pub fn list_entries(&self, m2dir: M2dir) -> Result<Vec<M2dirEntry>, M2dirClientError> {
-        self.run(M2dirMessageList::new(m2dir))
+        self.run(M2dirEntryList::new(m2dir, M2dirEntryListOptions::default()))
     }
 
     /// Reads the file backing `entry` and validates its checksum.
@@ -306,20 +312,31 @@ impl M2dirClient {
         m2dir: M2dir,
         id: impl ToString,
     ) -> Result<(M2dirEntry, Vec<u8>), M2dirClientError> {
-        let M2dirMessageGetOutput { entry, contents } =
-            self.run(M2dirMessageGet::new(m2dir, id))?;
+        let M2dirEntryGetOutput { entry, contents } = self.run(M2dirEntryGet::new(
+            m2dir,
+            id,
+            M2dirEntryGetOptions::default(),
+        ))?;
         Ok((entry, contents))
     }
 
     /// Writes `bytes` to a temporary file inside `m2dir`, then
     /// atomically renames it to its checksum-based final filename.
     pub fn store(&self, m2dir: M2dir, bytes: Vec<u8>) -> Result<M2dirEntry, M2dirClientError> {
-        self.run(M2dirMessageStore::new(m2dir, bytes))
+        self.run(M2dirEntryStore::new(
+            m2dir,
+            bytes,
+            M2dirEntryStoreOptions::default(),
+        ))
     }
 
     /// Removes entry `id` and every matching `.meta/<id>*` file.
-    pub fn delete_message(&self, m2dir: M2dir, id: impl ToString) -> Result<(), M2dirClientError> {
-        self.run(M2dirMessageDelete::new(m2dir, id))
+    pub fn delete_entry(&self, m2dir: M2dir, id: impl ToString) -> Result<(), M2dirClientError> {
+        self.run(M2dirEntryDelete::new(
+            m2dir,
+            id,
+            M2dirEntryDeleteOptions::default(),
+        ))
     }
 
     // ---- Flags --------------------------------------------------
@@ -348,7 +365,12 @@ impl M2dirClient {
         id: impl AsRef<str>,
         flags: M2dirFlags,
     ) -> Result<(), M2dirClientError> {
-        self.run(M2dirFlagAdd::new(m2dir, id, flags))
+        self.run(M2dirFlagAdd::new(
+            m2dir,
+            id,
+            flags,
+            M2dirFlagAddOptions::default(),
+        ))
     }
 
     /// Removes `flags` from entry `id`'s flags metadata file. When
@@ -359,7 +381,12 @@ impl M2dirClient {
         id: impl AsRef<str>,
         flags: M2dirFlags,
     ) -> Result<(), M2dirClientError> {
-        self.run(M2dirFlagRemove::new(m2dir, id, flags))
+        self.run(M2dirFlagRemove::new(
+            m2dir,
+            id,
+            flags,
+            M2dirFlagRemoveOptions::default(),
+        ))
     }
 
     /// Replaces entry `id`'s flags metadata file with `flags`,
@@ -370,23 +397,28 @@ impl M2dirClient {
         id: impl AsRef<str>,
         flags: M2dirFlags,
     ) -> Result<(), M2dirClientError> {
-        self.run(M2dirFlagSet::new(m2dir, id, flags))
+        self.run(M2dirFlagSet::new(
+            m2dir,
+            id,
+            flags,
+            M2dirFlagSetOptions::default(),
+        ))
     }
 }
 
 // ---- Loaders -----------------------------------------------------
 
-fn load_m2store(path: M2dirPath) -> Result<M2store, LoadM2storeError> {
+fn load_store(path: M2dirPath) -> Result<M2dirStore, LoadM2dirStoreError> {
     if !Path::new(path.as_str()).is_dir() {
-        return Err(LoadM2storeError::NotDir(path));
+        return Err(LoadM2dirStoreError::NotDir(path));
     }
 
     let marker = path.join(DOT_M2STORE);
     if !Path::new(marker.as_str()).exists() {
-        return Err(LoadM2storeError::NoDotM2store(path));
+        return Err(LoadM2dirStoreError::NoDotM2store(path));
     }
 
-    Ok(M2store::from_path(path))
+    Ok(M2dirStore::from_path(path))
 }
 
 fn load_m2dir(path: M2dirPath) -> Result<M2dir, LoadM2dirError> {
@@ -574,31 +606,31 @@ mod tests {
     }
 
     #[test]
-    fn create_mailbox_writes_dot_m2dir() {
+    fn create_m2dir_writes_marker() {
         let (_dir, client) = client();
 
-        let inbox = client.create_mailbox("inbox").unwrap();
+        let inbox = client.create_m2dir("inbox").unwrap();
         assert!(Path::new(inbox.path().as_str()).is_dir());
         assert!(Path::new(inbox.marker_path().as_str()).exists());
         assert!(Path::new(inbox.meta_dir().as_str()).is_dir());
     }
 
     #[test]
-    fn list_mailboxes_finds_created_folder() {
+    fn list_m2dirs_finds_created_folder() {
         let (_dir, client) = client();
 
-        client.create_mailbox("inbox").unwrap();
-        client.create_mailbox("sent").unwrap();
+        client.create_m2dir("inbox").unwrap();
+        client.create_m2dir("sent").unwrap();
 
-        let mailboxes = client.list_mailboxes().unwrap();
-        assert_eq!(mailboxes.len(), 2);
+        let m2dirs = client.list_m2dirs().unwrap();
+        assert_eq!(m2dirs.len(), 2);
     }
 
     #[test]
     fn store_and_list_entries_round_trip() {
         let (_dir, client) = client();
 
-        let inbox = client.create_mailbox("inbox").unwrap();
+        let inbox = client.create_m2dir("inbox").unwrap();
         let msg = b"From: alice@example.org\r\nDate: Tue, 15 Apr 1994 08:12:31 GMT\r\nSubject: hi\r\n\r\nbody\r\n";
 
         let entry = client.store(inbox.clone(), msg.to_vec()).unwrap();
@@ -617,14 +649,14 @@ mod tests {
     fn flags_round_trip_via_meta() {
         let (_dir, client) = client();
 
-        let inbox = client.create_mailbox("inbox").unwrap();
+        let inbox = client.create_m2dir("inbox").unwrap();
         let msg = b"From: a\r\n\r\nbody\r\n";
         let entry = client.store(inbox.clone(), msg.to_vec()).unwrap();
 
         let initial = client.read_flags(&inbox, entry.id()).unwrap();
         assert_eq!(initial.len(), 0);
 
-        let mut to_add = crate::flag::M2dirFlags::default();
+        let mut to_add = crate::flag::types::M2dirFlags::default();
         to_add.insert("$seen");
         to_add.insert("$forwarded");
         client.add_flags(&inbox, entry.id(), to_add).unwrap();
@@ -634,7 +666,7 @@ mod tests {
         assert!(after_add.contains("$seen"));
         assert!(after_add.contains("$forwarded"));
 
-        let mut to_remove = crate::flag::M2dirFlags::default();
+        let mut to_remove = crate::flag::types::M2dirFlags::default();
         to_remove.insert("$seen");
         client.remove_flags(&inbox, entry.id(), to_remove).unwrap();
 
@@ -642,7 +674,7 @@ mod tests {
         assert_eq!(after_remove.len(), 1);
         assert!(after_remove.contains("$forwarded"));
 
-        let mut replacement = crate::flag::M2dirFlags::default();
+        let mut replacement = crate::flag::types::M2dirFlags::default();
         replacement.insert("custom");
         replacement.insert("$junk");
         client.set_flags(&inbox, entry.id(), replacement).unwrap();
@@ -653,7 +685,11 @@ mod tests {
         assert!(after_set.contains("$junk"));
 
         client
-            .set_flags(&inbox, entry.id(), crate::flag::M2dirFlags::default())
+            .set_flags(
+                &inbox,
+                entry.id(),
+                crate::flag::types::M2dirFlags::default(),
+            )
             .unwrap();
         let after_clear = client.read_flags(&inbox, entry.id()).unwrap();
         assert!(after_clear.is_empty());
@@ -661,18 +697,18 @@ mod tests {
     }
 
     #[test]
-    fn delete_message_removes_file_and_flags_meta() {
+    fn delete_entry_removes_file_and_flags_meta() {
         let (_dir, client) = client();
 
-        let inbox = client.create_mailbox("inbox").unwrap();
+        let inbox = client.create_m2dir("inbox").unwrap();
         let entry = client.store(inbox.clone(), b"hello".to_vec()).unwrap();
 
-        let mut flags = crate::flag::M2dirFlags::default();
+        let mut flags = crate::flag::types::M2dirFlags::default();
         flags.insert("$seen");
         client.add_flags(&inbox, entry.id(), flags).unwrap();
         assert!(Path::new(inbox.flags_path(entry.id()).as_str()).exists());
 
-        client.delete_message(inbox.clone(), entry.id()).unwrap();
+        client.delete_entry(inbox.clone(), entry.id()).unwrap();
         assert!(!Path::new(entry.path().as_str()).exists());
         assert!(!Path::new(inbox.flags_path(entry.id()).as_str()).exists());
 
@@ -681,17 +717,17 @@ mod tests {
     }
 
     #[test]
-    fn delete_mailbox_removes_tree() {
+    fn delete_m2dir_removes_tree() {
         let (_dir, client) = client();
 
-        let inbox = client.create_mailbox("inbox").unwrap();
+        let inbox = client.create_m2dir("inbox").unwrap();
         let path = inbox.path().clone();
         assert!(Path::new(path.as_str()).is_dir());
 
-        client.delete_mailbox(path.clone()).unwrap();
+        client.delete_m2dir(path.clone()).unwrap();
         assert!(!Path::new(path.as_str()).exists());
     }
 
     /// Bring the marker constant into scope for tests.
-    use crate::m2store::DOT_M2STORE;
+    use crate::store::DOT_M2STORE;
 }

@@ -1,4 +1,4 @@
-//! Single m2dir message entry: id, path, checksum helpers.
+//! Single m2dir entry: id, path, checksum helpers.
 
 use core::fmt::{self, Write};
 
@@ -6,7 +6,23 @@ use alloc::{string::String, vec::Vec};
 
 use thiserror::Error;
 
-use crate::{base64, flag::M2dirFlags, fnv, path::M2dirPath};
+use base64::{Engine, engine::general_purpose::URL_SAFE};
+
+use crate::{flag::types::M2dirFlags, path::M2dirPath};
+
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+/// FNV-1a 64-bit hash; kept in-crate to preserve the exact m2dir
+/// specification output for the checksum tail.
+fn fnv_hash(salt: impl AsRef<[u8]>, bytes: impl AsRef<[u8]>) -> u64 {
+    let mut hash = FNV_OFFSET;
+    for byte in salt.as_ref().iter().chain(bytes.as_ref().iter()) {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
 
 /// Errors that can occur while parsing or validating an entry
 /// filename.
@@ -34,7 +50,7 @@ pub enum ParseFilenameError {
     },
 }
 
-/// A single message entry inside an [`crate::m2dir::M2dir`].
+/// A single entry inside an [`crate::m2dir::types::M2dir`].
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct M2dirEntry {
     id: String,
@@ -52,7 +68,7 @@ impl M2dirEntry {
         }
     }
 
-    /// Returns the path to the message file.
+    /// Returns the path to the entry file.
     pub fn path(&self) -> &M2dirPath {
         &self.path
     }
@@ -118,14 +134,15 @@ pub fn write_checksum<B: AsRef<[u8]>, W: Write>(bytes: B, mut w: W) -> fmt::Resu
     let size: [u8; 4] = (bytes.len() as u32).to_le_bytes();
 
     checksum[..4].copy_from_slice(&size);
-    checksum[4..].copy_from_slice(&fnv::hash(size, bytes).to_le_bytes());
-    base64::encode(&checksum, &mut w)?;
-    Ok(())
+    checksum[4..].copy_from_slice(&fnv_hash(size, bytes).to_le_bytes());
+    w.write_str(&URL_SAFE.encode(checksum))
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::entry::*;
+    use alloc::string::String;
+
+    use crate::entry::types::*;
 
     #[test]
     fn checksum_is_deterministic() {

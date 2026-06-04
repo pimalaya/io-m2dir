@@ -2,17 +2,17 @@
 //!
 //! Drives the full [`M2dirClient`] surface against a freshly created
 //! tempdir. The test is autonomous: it provisions its own m2store, its
-//! own m2dirs, and its own messages, then exercises every public
+//! own m2dirs, and its own entries, then exercises every public
 //! operation in sequence:
 //!
 //! ```text
 //! INIT STORE
-//!   → MAILBOX CREATE inbox / sent / nested
-//!   → MAILBOX LIST            (verify all three are visible)
+//!   → M2DIR CREATE inbox / sent / nested
+//!   → M2DIR LIST              (verify all three are visible)
 //!   → OPEN M2DIR inbox
-//!   → MESSAGE STORE x3        (inbox)
-//!   → MESSAGE LIST            (verify count + ids match)
-//!   → MESSAGE GET             (verify checksum + body round-trip)
+//!   → ENTRY STORE x3          (inbox)
+//!   → ENTRY LIST              (verify count + ids match)
+//!   → ENTRY GET               (verify checksum + body round-trip)
 //!   → FLAGS ADD $seen, $forwarded
 //!   → FLAGS READ              (verify both present)
 //!   → FLAGS REMOVE $seen
@@ -20,14 +20,16 @@
 //!   → FLAGS SET custom, $junk
 //!   → FLAGS READ              (verify replacement)
 //!   → FLAGS SET <empty>       (verify .flags file is removed)
-//!   → MESSAGE DELETE          (verify file + meta gone)
-//!   → MAILBOX DELETE sent
-//!   → MAILBOX LIST            (verify sent gone, two remain)
+//!   → ENTRY DELETE            (verify file + meta gone)
+//!   → M2DIR DELETE sent
+//!   → M2DIR LIST              (verify sent gone, two remain)
 //! ```
 
 use std::path::Path;
 
-use io_m2dir::{client::M2dirClient, flag::M2dirFlags, m2dir::DOT_M2DIR, m2store::DOT_M2STORE};
+use io_m2dir::{
+    client::M2dirClient, flag::types::M2dirFlags, m2dir::types::DOT_M2DIR, store::DOT_M2STORE,
+};
 use tempfile::tempdir;
 
 #[test]
@@ -45,13 +47,13 @@ fn end_to_end() {
         DOT_M2STORE,
     );
 
-    // ── MAILBOX CREATE ──────────────────────────────────────────────
+    // ── M2DIR CREATE ────────────────────────────────────────────────
 
-    let inbox = client.create_mailbox("inbox").expect("create inbox");
-    let sent = client.create_mailbox("sent").expect("create sent");
+    let inbox = client.create_m2dir("inbox").expect("create inbox");
+    let sent = client.create_m2dir("sent").expect("create sent");
     let nested = client
-        .create_mailbox("archives/2026")
-        .expect("create nested mailbox");
+        .create_m2dir("archives/2026")
+        .expect("create nested m2dir");
 
     for m2dir in [&inbox, &sent, &nested] {
         assert!(
@@ -72,13 +74,13 @@ fn end_to_end() {
         );
     }
 
-    // ── MAILBOX LIST (baseline) ─────────────────────────────────────
+    // ── M2DIR LIST (baseline) ───────────────────────────────────────
 
-    let mailboxes = client.list_mailboxes().expect("list mailboxes");
-    assert_eq!(mailboxes.len(), 3, "expected three mailboxes after create");
-    assert!(mailboxes.contains(&inbox), "inbox missing from listing");
-    assert!(mailboxes.contains(&sent), "sent missing from listing");
-    assert!(mailboxes.contains(&nested), "nested missing from listing");
+    let m2dirs = client.list_m2dirs().expect("list m2dirs");
+    assert_eq!(m2dirs.len(), 3, "expected three m2dirs after create");
+    assert!(m2dirs.contains(&inbox), "inbox missing from listing");
+    assert!(m2dirs.contains(&sent), "sent missing from listing");
+    assert!(m2dirs.contains(&nested), "nested missing from listing");
 
     // ── OPEN M2DIR (round-trip path → handle) ───────────────────────
 
@@ -91,7 +93,7 @@ fn end_to_end() {
         "re-opened m2dir path mismatch",
     );
 
-    // ── MESSAGE STORE x3 ────────────────────────────────────────────
+    // ── ENTRY STORE x3 ──────────────────────────────────────────────
 
     let body_a = build_eml("alice@example.org", "first");
     let body_b = build_eml("bob@example.org", "second");
@@ -99,13 +101,13 @@ fn end_to_end() {
 
     let entry_a = client
         .store(inbox.clone(), body_a.clone().into_bytes())
-        .expect("store first message");
+        .expect("store first entry");
     let entry_b = client
         .store(inbox.clone(), body_b.clone().into_bytes())
-        .expect("store second message");
+        .expect("store second entry");
     let entry_c = client
         .store(inbox.clone(), body_c.clone().into_bytes())
-        .expect("store third message");
+        .expect("store third entry");
 
     for entry in [&entry_a, &entry_b, &entry_c] {
         assert!(
@@ -118,20 +120,20 @@ fn end_to_end() {
     assert_ne!(entry_b.id(), entry_c.id(), "ids should be unique");
     assert_ne!(entry_a.id(), entry_c.id(), "ids should be unique");
 
-    // ── MESSAGE LIST ────────────────────────────────────────────────
+    // ── ENTRY LIST ──────────────────────────────────────────────────
 
-    let listed = client.list_entries(inbox.clone()).expect("list messages");
-    assert_eq!(listed.len(), 3, "expected three messages after store");
+    let listed = client.list_entries(inbox.clone()).expect("list entries");
+    assert_eq!(listed.len(), 3, "expected three entries after store");
     let listed_ids: Vec<&str> = listed.iter().map(|e| e.id()).collect();
     assert!(listed_ids.contains(&entry_a.id()), "entry_a missing");
     assert!(listed_ids.contains(&entry_b.id()), "entry_b missing");
     assert!(listed_ids.contains(&entry_c.id()), "entry_c missing");
 
-    // ── MESSAGE GET (checksum + body round-trip) ────────────────────
+    // ── ENTRY GET (checksum + body round-trip) ──────────────────────
 
     let (fetched, contents) = client
         .get(inbox.clone(), entry_a.id())
-        .expect("get first message");
+        .expect("get first entry");
     assert_eq!(fetched.id(), entry_a.id(), "fetched id mismatch");
     assert_eq!(contents, body_a.as_bytes(), "fetched body mismatch");
 
@@ -203,7 +205,7 @@ fn end_to_end() {
         ".flags file should be removed when set to empty",
     );
 
-    // ── MESSAGE DELETE ──────────────────────────────────────────────
+    // ── ENTRY DELETE ────────────────────────────────────────────────
 
     // Re-add a flag so we can confirm delete also wipes .meta entries.
     let mut flags = M2dirFlags::default();
@@ -214,7 +216,7 @@ fn end_to_end() {
     assert!(Path::new(inbox.flags_path(entry_b.id()).as_str()).exists());
 
     client
-        .delete_message(inbox.clone(), entry_b.id())
+        .delete_entry(inbox.clone(), entry_b.id())
         .expect("delete entry_b");
     assert!(
         !Path::new(entry_b.path().as_str()).exists(),
@@ -228,24 +230,22 @@ fn end_to_end() {
     let remaining = client
         .list_entries(inbox.clone())
         .expect("list after delete");
-    assert_eq!(remaining.len(), 2, "expected 2 messages after delete");
+    assert_eq!(remaining.len(), 2, "expected 2 entries after delete");
 
-    // ── MAILBOX DELETE ──────────────────────────────────────────────
+    // ── M2DIR DELETE ────────────────────────────────────────────────
 
     let sent_path = sent.path().clone();
-    client
-        .delete_mailbox(sent_path.clone())
-        .expect("delete sent");
+    client.delete_m2dir(sent_path.clone()).expect("delete sent");
     assert!(
         !Path::new(sent_path.as_str()).exists(),
         "sent dir should be removed",
     );
 
-    let mailboxes = client.list_mailboxes().expect("list after mailbox delete");
-    assert_eq!(mailboxes.len(), 2, "expected 2 mailboxes after delete");
-    assert!(mailboxes.contains(&inbox), "inbox still present");
-    assert!(mailboxes.contains(&nested), "nested still present");
-    assert!(!mailboxes.contains(&sent), "sent should be gone");
+    let m2dirs = client.list_m2dirs().expect("list after m2dir delete");
+    assert_eq!(m2dirs.len(), 2, "expected 2 m2dirs after delete");
+    assert!(m2dirs.contains(&inbox), "inbox still present");
+    assert!(m2dirs.contains(&nested), "nested still present");
+    assert!(!m2dirs.contains(&sent), "sent should be gone");
 }
 
 fn build_eml(from: &str, tag: &str) -> String {

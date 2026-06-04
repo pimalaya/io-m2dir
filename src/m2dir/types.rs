@@ -7,9 +7,15 @@ use alloc::{
     string::{String, ToString},
 };
 
+use base64::{Engine, engine::general_purpose::URL_SAFE};
 use thiserror::Error;
 
-use crate::{base64, entry::write_checksum, parse::extract_date, path::M2dirPath};
+use crate::{entry::types::write_checksum, path::M2dirPath};
+
+/// Epoch timestamp used as the filename date prefix when the message
+/// has no parseable `Date:` header. Matches the original behaviour of
+/// falling back to `Datetime::default()` when extraction failed.
+const EPOCH_DATE: &str = "1970-01-01T00:00:00Z";
 
 /// Marker filename written into every m2dir.
 pub const DOT_M2DIR: &str = ".m2dir";
@@ -75,14 +81,9 @@ impl M2dir {
         let mut checksum = String::new();
         write_checksum(bytes, &mut checksum).expect("base64 encoding to a string is always valid");
 
-        let dt = core::str::from_utf8(bytes)
-            .ok()
-            .and_then(extract_date)
-            .unwrap_or_default();
+        let dt = extract_date(bytes).unwrap_or_else(|| EPOCH_DATE.to_string());
 
-        let mut nonce = String::new();
-        base64::encode(nonce_bytes, &mut nonce)
-            .expect("base64 encoding to a string is always valid");
+        let nonce = URL_SAFE.encode(nonce_bytes);
 
         let id = format!("{checksum}.{nonce}");
         let filename = format!("{dt},{id}");
@@ -141,4 +142,39 @@ impl From<&str> for M2dir {
             path: path.to_string().into(),
         }
     }
+}
+
+/// Extracts the `Date:` header from a MIME message and formats it as
+/// `YYYY-MM-DDTHH:MM:SS[Z|±HHMM]` for the m2dir filename prefix.
+///
+/// Returns [`None`] if the header is missing or unparseable. Without
+/// the `client` feature there is no parser available and this returns
+/// [`None`] unconditionally; callers fall back to [`EPOCH_DATE`].
+#[cfg(feature = "client")]
+fn extract_date(bytes: &[u8]) -> Option<String> {
+    use core::fmt::Write;
+
+    use mail_parser::MessageParser;
+
+    let msg = MessageParser::new().with_date_headers().parse(bytes)?;
+    let dt = msg.date()?;
+
+    let mut s = String::new();
+    let _ = write!(
+        s,
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second,
+    );
+    if dt.tz_hour == 0 && dt.tz_minute == 0 {
+        s.push('Z');
+    } else {
+        let sign = if dt.tz_before_gmt { '-' } else { '+' };
+        let _ = write!(s, "{sign}{:02}{:02}", dt.tz_hour, dt.tz_minute);
+    }
+    Some(s)
+}
+
+#[cfg(not(feature = "client"))]
+fn extract_date(bytes: &[u8]) -> Option<String> {
+    crate::parse::extract_date(bytes)
 }

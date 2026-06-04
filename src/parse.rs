@@ -1,80 +1,63 @@
-//! Minimal crate-local module for extracting parts of a MIME message
-//! without parsing the whole structure.
+//! No-std fallback `Date:`-header parser used when the `client`
+//! feature is off (which would otherwise pull in `mail-parser` and its
+//! `std` dependency). Kept here only because mail-parser is not
+//! `no_std`-compatible; client builds use mail-parser instead.
 
 use core::{
-    error::Error,
-    fmt::{self, Display},
+    fmt::{self, Write},
     iter::Peekable,
 };
 
 use alloc::string::String;
 
-pub fn extract_date(mime: &str) -> Option<Datetime> {
-    mime.lines().find_map(|line| {
-        if line.starts_with("Date:") {
-            line.trim_start_matches("Date:")
-                .trim()
-                .split(';')
-                .next()
-                .and_then(|s| parse_rfc2822_datetime(s).ok())
+/// Returns the formatted `YYYY-MM-DDTHH:MM:SS[Z|±HHMM]` date from the
+/// MIME message's `Date:` header, or [`None`] if missing/unparseable.
+pub(crate) fn extract_date(bytes: &[u8]) -> Option<String> {
+    let mime = core::str::from_utf8(bytes).ok()?;
+    let value = mime.lines().find_map(|line| {
+        let rest = line.strip_prefix("Date:")?;
+        rest.trim().split(';').next()
+    })?;
+    let dt = parse_rfc2822_datetime(value).ok()?;
+    let mut s = String::new();
+    fmt_datetime(&dt, &mut s).ok()?;
+    Some(s)
+}
+
+struct Datetime {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    offset_minutes: i16,
+}
+
+fn fmt_datetime(dt: &Datetime, w: &mut String) -> fmt::Result {
+    write!(
+        w,
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second,
+    )?;
+    if dt.offset_minutes == 0 {
+        w.write_char('Z')
+    } else {
+        let sign = if dt.offset_minutes.is_positive() {
+            '+'
         } else {
-            None
-        }
-    })
-}
-
-#[derive(Debug, PartialEq)]
-pub struct Datetime {
-    pub year: u16,
-    pub month: u8,
-    pub day: u8,
-    pub hour: u8,
-    pub minute: u8,
-    pub second: u8,
-    pub offset_minutes: i16,
-}
-
-impl Default for Datetime {
-    fn default() -> Self {
-        Self {
-            year: 1970,
-            month: 1,
-            day: 1,
-            hour: 0,
-            minute: 0,
-            second: 0,
-            offset_minutes: 0,
-        }
+            '-'
+        };
+        let abs = dt.offset_minutes.unsigned_abs();
+        write!(w, "{sign}{:02}{:02}", abs / 60, abs % 60)
     }
 }
 
-impl Display for Datetime {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-            self.year, self.month, self.day, self.hour, self.minute, self.second
-        )?;
-        if self.offset_minutes == 0 {
-            write!(f, "Z")
-        } else {
-            let sign = if self.offset_minutes.is_positive() {
-                '+'
-            } else {
-                '-'
-            };
-            let hours = self.offset_minutes / 60;
-            let minutes = self.offset_minutes % 60;
-            write!(f, "{sign}{hours:02}{minutes:02}")
-        }
-    }
-}
-
-pub fn parse_rfc2822_datetime(s: &str) -> Result<Datetime, Rfc2822Error> {
+fn parse_rfc2822_datetime(s: &str) -> Result<Datetime, ()> {
     let chars = &mut s.chars().peekable();
     skip_whitespace(chars);
 
-    // Skip day of week
+    // Skip optional day of week ("Mon, ", "Tue, ", ...)
     if let Some(c) = chars.peek()
         && c.is_alphabetic()
     {
@@ -88,9 +71,8 @@ pub fn parse_rfc2822_datetime(s: &str) -> Result<Datetime, Rfc2822Error> {
 
     let day = next_two_digit_number(chars)?;
     next_space(chars)?;
-
     if !(1..=31).contains(&day) {
-        return Err(Rfc2822Error::DayOutOfRange(day));
+        return Err(());
     }
 
     let month = parse_month(chars)?;
@@ -102,20 +84,20 @@ pub fn parse_rfc2822_datetime(s: &str) -> Result<Datetime, Rfc2822Error> {
     let hour = next_two_digit_number(chars)?;
     next_colon(chars)?;
     if hour > 23 {
-        return Err(Rfc2822Error::HourOutOfRange(hour));
+        return Err(());
     }
 
     let minute = next_two_digit_number(chars)?;
     next_colon(chars)?;
     if minute > 59 {
-        return Err(Rfc2822Error::MinuteOutOfRange(minute));
+        return Err(());
     }
 
+    // NOTE: leap second is allowed (60).
     let second = next_two_digit_number(chars)?;
     skip_whitespace(chars);
-    // NOTE: leap second is allowed.
     if second > 60 {
-        return Err(Rfc2822Error::SecondOutOfRange(minute));
+        return Err(());
     }
 
     let offset_minutes = parse_timezone(chars)?;
@@ -131,7 +113,7 @@ pub fn parse_rfc2822_datetime(s: &str) -> Result<Datetime, Rfc2822Error> {
     })
 }
 
-fn parse_month<I>(chars: &mut Peekable<I>) -> Result<u8, Rfc2822Error>
+fn parse_month<I>(chars: &mut Peekable<I>) -> Result<u8, ()>
 where
     I: Iterator<Item = char>,
 {
@@ -148,13 +130,13 @@ where
         (Some('O'), Some('c'), Some('t')) => Ok(10),
         (Some('N'), Some('o'), Some('v')) => Ok(11),
         (Some('D'), Some('e'), Some('c')) => Ok(12),
-        _ => Err(Rfc2822Error::InvalidMonth),
+        _ => Err(()),
     }
 }
 
-fn parse_timezone(chars: &mut impl Iterator<Item = char>) -> Result<i16, Rfc2822Error> {
+fn parse_timezone(chars: &mut impl Iterator<Item = char>) -> Result<i16, ()> {
     match chars.next() {
-        Some(c @ '+') | Some(c @ '-') => {
+        Some(c @ ('+' | '-')) => {
             let sign = if c == '+' { 1 } else { -1 };
             let hour = next_two_digit_number(chars)? as i16;
             let minute = next_two_digit_number(chars)? as i16;
@@ -165,7 +147,6 @@ fn parse_timezone(chars: &mut impl Iterator<Item = char>) -> Result<i16, Rfc2822
             for c in chars {
                 s.push(c);
             }
-
             match s.as_str() {
                 "Z" | "UTC" | "GMT" => Ok(0),
                 "EDT" => Ok(-4 * 60),
@@ -173,18 +154,18 @@ fn parse_timezone(chars: &mut impl Iterator<Item = char>) -> Result<i16, Rfc2822
                 "CST" | "MDT" => Ok(-6 * 60),
                 "MST" | "PDT" => Ok(-6 * 60),
                 "PST" => Ok(-7 * 60),
-                _ => Err(Rfc2822Error::InvalidTimezone(s)),
+                _ => Err(()),
             }
         }
-        _ => Err(Rfc2822Error::UnexpectedEnd),
+        None => Err(()),
     }
 }
 
-fn next_two_digit_number(chars: &mut impl Iterator<Item = char>) -> Result<u8, Rfc2822Error> {
+fn next_two_digit_number(chars: &mut impl Iterator<Item = char>) -> Result<u8, ()> {
     Ok(10 * next_digit(chars)? + next_digit(chars)?)
 }
 
-fn next_four_digit_number(chars: &mut impl Iterator<Item = char>) -> Result<u16, Rfc2822Error> {
+fn next_four_digit_number(chars: &mut impl Iterator<Item = char>) -> Result<u16, ()> {
     Ok(1000 * next_digit(chars)? as u16
         + 100 * next_digit(chars)? as u16
         + 10 * next_digit(chars)? as u16
@@ -192,29 +173,26 @@ fn next_four_digit_number(chars: &mut impl Iterator<Item = char>) -> Result<u16,
 }
 
 #[inline]
-fn next_digit(chars: &mut impl Iterator<Item = char>) -> Result<u8, Rfc2822Error> {
+fn next_digit(chars: &mut impl Iterator<Item = char>) -> Result<u8, ()> {
     match chars.next() {
         Some(c) if c.is_ascii_digit() => Ok(c as u8 - b'0'),
-        Some(_) => Err(Rfc2822Error::ExpectedDigit),
-        None => Err(Rfc2822Error::UnexpectedEnd),
+        _ => Err(()),
     }
 }
 
 #[inline]
-fn next_colon(chars: &mut impl Iterator<Item = char>) -> Result<(), Rfc2822Error> {
+fn next_colon(chars: &mut impl Iterator<Item = char>) -> Result<(), ()> {
     match chars.next() {
         Some(':') => Ok(()),
-        Some(_) => Err(Rfc2822Error::ExpectedColon),
-        None => Err(Rfc2822Error::UnexpectedEnd),
+        _ => Err(()),
     }
 }
 
 #[inline]
-fn next_space(chars: &mut impl Iterator<Item = char>) -> Result<(), Rfc2822Error> {
+fn next_space(chars: &mut impl Iterator<Item = char>) -> Result<(), ()> {
     match chars.next() {
         Some(' ') => Ok(()),
-        Some(_) => Err(Rfc2822Error::ExpectedSpace),
-        None => Err(Rfc2822Error::UnexpectedEnd),
+        _ => Err(()),
     }
 }
 
@@ -228,109 +206,46 @@ fn skip_whitespace(chars: &mut Peekable<impl Iterator<Item = char>>) {
     }
 }
 
-#[derive(Debug)]
-pub enum Rfc2822Error {
-    UnexpectedEnd,
-    ExpectedDigit,
-    ExpectedColon,
-    ExpectedSpace,
-    InvalidMonth,
-    InvalidTimezone(String),
-    DayOutOfRange(u8),
-    HourOutOfRange(u8),
-    MinuteOutOfRange(u8),
-    SecondOutOfRange(u8),
-}
-
-impl Error for Rfc2822Error {}
-
-impl Display for Rfc2822Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "error when parsing RFC 2822 datetime: ")?;
-        match self {
-            Rfc2822Error::UnexpectedEnd => write!(f, "unexpected end of string"),
-            Rfc2822Error::ExpectedDigit => write!(f, "expected digit"),
-            Rfc2822Error::ExpectedColon => write!(f, "expected colon"),
-            Rfc2822Error::ExpectedSpace => write!(f, "expected space"),
-            Rfc2822Error::InvalidMonth => write!(f, "invalid month"),
-            Rfc2822Error::InvalidTimezone(tz) => write!(f, "invalid timezone: {tz}"),
-            Rfc2822Error::DayOutOfRange(d) => write!(f, "day out of range: {d}"),
-            Rfc2822Error::HourOutOfRange(h) => write!(f, "hour out of range: {h}"),
-            Rfc2822Error::MinuteOutOfRange(m) => write!(f, "minute out of range: {m}"),
-            Rfc2822Error::SecondOutOfRange(s) => write!(f, "second out of range: {s}"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::parse::*;
+    use super::*;
 
     #[test]
-    fn valid_datetime() {
-        let dt = parse_rfc2822_datetime("Tue, 15 Apr 1994 08:12:31 GMT").unwrap();
+    fn extracts_from_full_message() {
+        let mime = "Date: Tue, 15 Apr 1994 08:12:31 GMT\r\nFrom: a@b\r\n\r\nbody";
         assert_eq!(
-            dt,
-            Datetime {
-                year: 1994,
-                month: 4,
-                day: 15,
-                hour: 8,
-                minute: 12,
-                second: 31,
-                offset_minutes: 0,
-            }
-        );
-
-        let dt = parse_rfc2822_datetime("15 Jun 1994 08:12:31 +0200").unwrap();
-        assert_eq!(
-            dt,
-            Datetime {
-                year: 1994,
-                month: 6,
-                day: 15,
-                hour: 8,
-                minute: 12,
-                second: 31,
-                offset_minutes: 120,
-            }
-        );
-
-        let dt = parse_rfc2822_datetime("Tue, 15 Nov 1994 08:12:31 -0430").unwrap();
-        assert_eq!(
-            dt,
-            Datetime {
-                year: 1994,
-                month: 11,
-                day: 15,
-                hour: 8,
-                minute: 12,
-                second: 31,
-                offset_minutes: -270,
-            }
+            extract_date(mime.as_bytes()).as_deref(),
+            Some("1994-04-15T08:12:31Z"),
         );
     }
 
     #[test]
-    fn invalid_datetime() {
-        match parse_rfc2822_datetime("Tue, 15 Xov 1994 08:12:31 GMT") {
-            Err(Rfc2822Error::InvalidMonth) => {}
-            r => panic!("Expected invalid month error. Got: {r:?}"),
-        }
+    fn formats_positive_offset() {
+        let mime = "Date: 15 Jun 1994 08:12:31 +0200\r\n";
+        assert_eq!(
+            extract_date(mime.as_bytes()).as_deref(),
+            Some("1994-06-15T08:12:31+0200"),
+        );
+    }
 
-        match parse_rfc2822_datetime("15 Nov 1994 24:12:31 -0500") {
-            Err(Rfc2822Error::HourOutOfRange(_)) => {}
-            r => panic!("Expected hour out of range error. Got: {r:?}"),
-        }
+    #[test]
+    fn formats_negative_offset() {
+        let mime = "Date: 15 Nov 1994 08:12:31 -0430\r\n";
+        assert_eq!(
+            extract_date(mime.as_bytes()).as_deref(),
+            Some("1994-11-15T08:12:31-0430"),
+        );
+    }
 
-        match parse_rfc2822_datetime("15 Nov 1994 08:12:31 FOO") {
-            Err(Rfc2822Error::InvalidTimezone(_)) => {}
-            r => panic!("Expected invalid timezone error. Got: {r:?}"),
-        }
+    #[test]
+    fn missing_header_is_none() {
+        let mime = "From: a@b\r\n\r\nbody";
+        assert_eq!(extract_date(mime.as_bytes()), None);
+    }
 
-        match parse_rfc2822_datetime("Tue, 32 Nov 1994 08:12:31 -0500") {
-            Err(Rfc2822Error::DayOutOfRange(_)) => {}
-            r => panic!("Expected day out of range error. Got: {r:?}"),
-        }
+    #[test]
+    fn invalid_date_is_none() {
+        let mime = "Date: not a date\r\n";
+        assert_eq!(extract_date(mime.as_bytes()), None);
     }
 }
