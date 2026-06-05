@@ -124,7 +124,7 @@ Enable the `client` feature (on by default). `M2dirClient::new(root)` wraps a fi
 
 ```toml,ignore
 [dependencies]
-io-m2dir = "0.0.1" # client is enabled by default
+io-m2dir = "0.1.0" # client is enabled by default
 ```
 
 ```rust,no_run

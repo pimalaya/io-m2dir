@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-05
+
 ### Added
 
 - Added the `M2dirCoroutine` trait mirroring `core::ops::Coroutine`.
@@ -61,4 +63,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Standard, blocking client backed by `std::fs` that drives any standard-Yield coroutine to completion, with `read_entries_par` for parallel reads via `std::thread::scope`. When the feature is off the `Date:` header parser falls back to a private no_std implementation so date prefixes are still computed in pure no_std builds.
 
-[unreleased]: https://github.com/pimalaya/io-m2dir/compare/root..HEAD
+[unreleased]: https://github.com/pimalaya/io-m2dir/compare/v0.1.0..HEAD
+[0.1.0]: https://github.com/pimalaya/io-m2dir/compare/root..v0.1.0
