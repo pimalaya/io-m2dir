@@ -13,7 +13,5 @@ pub mod coroutine;
 pub mod entry;
 pub mod flag;
 pub mod m2dir;
-#[cfg(not(feature = "client"))]
-mod parse;
 pub mod path;
 pub mod store;

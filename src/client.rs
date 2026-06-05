@@ -29,7 +29,8 @@ use crate::{
         get::*,
         list::*,
         store::*,
-        types::{M2dirEntry, M2dirFullEntry, ParseFilenameError, validate_checksum},
+        types::{M2dirEntry, M2dirFullEntry, ParseFilenameError},
+        utils::validate_checksum,
     },
     flag::types::M2dirFlags,
     flag::{add::*, remove::*, set::*},
@@ -40,18 +41,16 @@ use crate::{
         types::{DOT_M2DIR, LoadM2dirError, M2dir},
     },
     path::M2dirPath,
-    store::{DOT_M2STORE, LoadM2dirStoreError, M2dirStore, NewFolderError},
+    store::{DOT_M2STORE, M2dirStore, M2dirStoreError},
 };
 
 /// Errors returned by [`M2dirClient`].
 #[derive(Debug, Error)]
 pub enum M2dirClientError {
     #[error(transparent)]
-    LoadStore(#[from] LoadM2dirStoreError),
+    Store(#[from] M2dirStoreError),
     #[error(transparent)]
     LoadM2dir(#[from] LoadM2dirError),
-    #[error(transparent)]
-    NewFolder(#[from] NewFolderError),
     #[error(transparent)]
     CreateM2dir(#[from] M2dirCreateError),
     #[error(transparent)]
@@ -408,14 +407,14 @@ impl M2dirClient {
 
 // ---- Loaders -----------------------------------------------------
 
-fn load_store(path: M2dirPath) -> Result<M2dirStore, LoadM2dirStoreError> {
+fn load_store(path: M2dirPath) -> Result<M2dirStore, M2dirStoreError> {
     if !Path::new(path.as_str()).is_dir() {
-        return Err(LoadM2dirStoreError::NotDir(path));
+        return Err(M2dirStoreError::NotDir(path));
     }
 
     let marker = path.join(DOT_M2STORE);
     if !Path::new(marker.as_str()).exists() {
-        return Err(LoadM2dirStoreError::NoDotM2store(path));
+        return Err(M2dirStoreError::NoDotM2store(path));
     }
 
     Ok(M2dirStore::from_path(path))
@@ -589,7 +588,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::client::*;
+    use crate::{client::*, flag::types::M2dirFlags, store::DOT_M2STORE};
 
     fn client() -> (tempfile::TempDir, M2dirClient) {
         let dir = tempdir().unwrap();
@@ -656,7 +655,7 @@ mod tests {
         let initial = client.read_flags(&inbox, entry.id()).unwrap();
         assert_eq!(initial.len(), 0);
 
-        let mut to_add = crate::flag::types::M2dirFlags::default();
+        let mut to_add = M2dirFlags::default();
         to_add.insert("$seen");
         to_add.insert("$forwarded");
         client.add_flags(&inbox, entry.id(), to_add).unwrap();
@@ -666,7 +665,7 @@ mod tests {
         assert!(after_add.contains("$seen"));
         assert!(after_add.contains("$forwarded"));
 
-        let mut to_remove = crate::flag::types::M2dirFlags::default();
+        let mut to_remove = M2dirFlags::default();
         to_remove.insert("$seen");
         client.remove_flags(&inbox, entry.id(), to_remove).unwrap();
 
@@ -674,7 +673,7 @@ mod tests {
         assert_eq!(after_remove.len(), 1);
         assert!(after_remove.contains("$forwarded"));
 
-        let mut replacement = crate::flag::types::M2dirFlags::default();
+        let mut replacement = M2dirFlags::default();
         replacement.insert("custom");
         replacement.insert("$junk");
         client.set_flags(&inbox, entry.id(), replacement).unwrap();
@@ -685,11 +684,7 @@ mod tests {
         assert!(after_set.contains("$junk"));
 
         client
-            .set_flags(
-                &inbox,
-                entry.id(),
-                crate::flag::types::M2dirFlags::default(),
-            )
+            .set_flags(&inbox, entry.id(), M2dirFlags::default())
             .unwrap();
         let after_clear = client.read_flags(&inbox, entry.id()).unwrap();
         assert!(after_clear.is_empty());
@@ -703,7 +698,7 @@ mod tests {
         let inbox = client.create_m2dir("inbox").unwrap();
         let entry = client.store(inbox.clone(), b"hello".to_vec()).unwrap();
 
-        let mut flags = crate::flag::types::M2dirFlags::default();
+        let mut flags = M2dirFlags::default();
         flags.insert("$seen");
         client.add_flags(&inbox, entry.id(), flags).unwrap();
         assert!(Path::new(inbox.flags_path(entry.id()).as_str()).exists());
@@ -727,7 +722,4 @@ mod tests {
         client.delete_m2dir(path.clone()).unwrap();
         assert!(!Path::new(path.as_str()).exists());
     }
-
-    /// Bring the marker constant into scope for tests.
-    use crate::store::DOT_M2STORE;
 }

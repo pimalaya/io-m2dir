@@ -139,6 +139,8 @@ impl AsRef<std::path::Path> for M2dirPath {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use crate::path::M2dirPath;
 
     #[test]
@@ -183,7 +185,7 @@ mod tests {
     #[test]
     fn components_skips_empties() {
         let p = M2dirPath::new("/a//b/");
-        let parts: alloc::vec::Vec<&str> = p.components().collect();
+        let parts: Vec<&str> = p.components().collect();
         assert_eq!(parts, ["a", "b"]);
     }
 }

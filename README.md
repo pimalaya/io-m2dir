@@ -1,6 +1,6 @@
 # I/O m2dir [![Documentation](https://img.shields.io/docsrs/io-m2dir?style=flat&logo=docs.rs&logoColor=white)](https://docs.rs/io-m2dir/latest/io_m2dir) [![Matrix](https://img.shields.io/badge/chat-%23pimalaya-blue?style=flat&logo=matrix&logoColor=white)](https://matrix.to/#/#pimalaya:matrix.org) [![Mastodon](https://img.shields.io/badge/news-%40pimalaya-blue?style=flat&logo=mastodon&logoColor=white)](https://fosstodon.org/@pimalaya)
 
-m2dir client library, written in Rust.
+M2dir client library, written in Rust.
 
 This library is composed of 2 feature-gated layers:
 
@@ -63,7 +63,7 @@ No features required: works in `#![no_std]`, no filesystem calls, no async runti
 
 Drive a multi-step command (store an entry) against a blocking caller (the same shape works under async or in-memory replay):
 
-```rust,ignore
+```rust,no_run
 use std::{collections::hash_map::RandomState, fs, hash::{BuildHasher, Hasher}, process};
 
 use io_m2dir::{
@@ -127,20 +127,20 @@ Enable the `client` feature (on by default). `M2dirClient::new(root)` wraps a fi
 io-m2dir = "0.0.1" # client is enabled by default
 ```
 
-```rust,ignore
+```rust,no_run
 use io_m2dir::{client::M2dirClient, flag::types::M2dirFlags};
 
 let client = M2dirClient::new("/path/to/store");
 
-client.init_store()?;
-let inbox = client.create_m2dir("inbox")?;
+client.init_store().unwrap();
+let inbox = client.create_m2dir("inbox").unwrap();
 
 let bytes = b"From: alice@example.com\r\nSubject: Hello\r\n\r\nHello!\r\n".to_vec();
-let entry = client.store(inbox.clone(), bytes)?;
+let entry = client.store(inbox.clone(), bytes).unwrap();
 
 let mut flags = M2dirFlags::default();
 flags.insert("$seen");
-client.add_flags(&inbox, entry.id(), flags)?;
+client.add_flags(&inbox, entry.id(), flags).unwrap();
 
 println!("stored {} at {}", entry.id(), entry.path());
 ```

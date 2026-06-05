@@ -78,9 +78,11 @@ use crate::{
     coroutine::*,
     entry::{
         list::*,
-        types::{M2dirEntry, ParseFilenameError, validate_checksum},
+        types::{M2dirEntry, ParseFilenameError},
+        utils::validate_checksum,
     },
     m2dir::types::M2dir,
+    path::M2dirPath,
 };
 
 /// Failure causes during the m2dir GET flow.
@@ -161,7 +163,7 @@ impl M2dirCoroutine for M2dirEntryGet {
                 let bytes = contents.into_values().next().unwrap_or_default();
                 let entry = mem::replace(
                     entry,
-                    M2dirEntry::from_parts(String::new(), crate::path::M2dirPath::default()),
+                    M2dirEntry::from_parts(String::new(), M2dirPath::default()),
                 );
                 let checksum = entry.checksum();
 
@@ -208,8 +210,6 @@ impl fmt::Display for State {
 #[cfg(test)]
 mod tests {
     use alloc::collections::BTreeMap;
-
-    use crate::path::M2dirPath;
 
     use super::*;
 

@@ -48,7 +48,7 @@
 //! }
 //! ```
 
-use core::fmt;
+use core::{fmt, str};
 
 use alloc::collections::{BTreeMap, BTreeSet};
 
@@ -113,7 +113,7 @@ impl M2dirCoroutine for M2dirFlagAdd {
             }
             (State::Read, Some(M2dirArg::FileRead(contents))) => {
                 let bytes = contents.into_values().next().unwrap_or_default();
-                let existing = core::str::from_utf8(&bytes).unwrap_or("");
+                let existing = str::from_utf8(&bytes).unwrap_or("");
 
                 let mut merged = M2dirFlags::from_meta(existing);
                 merged.extend(self.flags.clone());
@@ -183,7 +183,7 @@ mod tests {
 
         let files = expect_wants_file_create(&mut add, Some(M2dirArg::FileRead(reply)));
         let (_, bytes) = files.into_iter().next().unwrap();
-        let serialized = core::str::from_utf8(&bytes).unwrap();
+        let serialized = str::from_utf8(&bytes).unwrap();
         assert!(serialized.contains("$seen"));
         assert!(serialized.contains("$forwarded"));
 
@@ -204,7 +204,7 @@ mod tests {
 
         let files = expect_wants_file_create(&mut add, Some(M2dirArg::FileRead(reply)));
         let (_, bytes) = files.into_iter().next().unwrap();
-        assert_eq!(core::str::from_utf8(&bytes).unwrap(), "$seen\n");
+        assert_eq!(str::from_utf8(&bytes).unwrap(), "$seen\n");
 
         expect_complete_ok(&mut add, Some(M2dirArg::FileCreate));
     }

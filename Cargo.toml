@@ -7,7 +7,7 @@ edition = "2024"
 rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 categories = ["email", "filesystem"]
-keywords = ["email", "m2dir", "client", "io-free"]
+keywords = ["email", "m2dir", "client", "io-free", "pim"]
 homepage = "https://pimalaya.org"
 documentation = "https://docs.rs/io-m2dir/latest/io_m2dir"
 repository = "https://github.com/pimalaya/io-m2dir"
@@ -25,7 +25,7 @@ tempfile = "3"
 
 [dependencies]
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
-log = "0.4"
-mail-parser = { version = "0.11", optional = true }
+log = { version = "0.4", default-features = false }
+mail-parser = { version = "0.11", default-features = false, optional = true }
 percent-encoding = { version = "2", default-features = false, features = ["alloc"] }
-thiserror = "2"
+thiserror = { version = "2", default-features = false }

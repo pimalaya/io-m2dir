@@ -51,7 +51,7 @@ use thiserror::Error;
 use crate::{
     coroutine::*,
     m2dir::types::M2dir,
-    store::{M2dirStore, NewFolderError},
+    store::{M2dirStore, M2dirStoreError},
 };
 
 /// Failure causes during the m2dir CREATE flow.
@@ -62,7 +62,7 @@ pub enum M2dirCreateError {
     #[error("M2DIR CREATE failed: missing coroutine arg")]
     MissingArg,
     #[error(transparent)]
-    Resolve(#[from] NewFolderError),
+    Resolve(#[from] M2dirStoreError),
 }
 
 /// Options for [`M2dirCreate::new`].
@@ -84,7 +84,7 @@ impl M2dirCreate {
         store: &M2dirStore,
         name: &str,
         opts: M2dirCreateOptions,
-    ) -> Result<Self, NewFolderError> {
+    ) -> Result<Self, M2dirStoreError> {
         let path = store.resolve_folder_path(name)?;
         let m2dir = M2dir::from_path(path);
 
@@ -162,6 +162,8 @@ impl fmt::Display for State {
 
 #[cfg(test)]
 mod tests {
+    use crate::path::M2dirPath;
+
     use super::*;
 
     #[test]
@@ -192,7 +194,7 @@ mod tests {
     fn escaping_name_returns_resolve_error_at_construction() {
         let store = M2dirStore::from_path("/tmp/store");
         let result = M2dirCreate::new(&store, "../escape", M2dirCreateOptions::default());
-        assert!(matches!(result, Err(NewFolderError::EscapesRoot(_))));
+        assert!(matches!(result, Err(M2dirStoreError::EscapesRoot(_))));
     }
 
     #[test]
@@ -230,7 +232,7 @@ mod tests {
     fn expect_wants_dir_create(
         cor: &mut M2dirCreate,
         arg: Option<M2dirArg>,
-    ) -> BTreeSet<crate::path::M2dirPath> {
+    ) -> BTreeSet<M2dirPath> {
         match cor.resume(arg) {
             M2dirCoroutineState::Yielded(M2dirYield::WantsDirCreate(paths)) => paths,
             state => panic!("expected WantsDirCreate, got {state:?}"),
@@ -240,7 +242,7 @@ mod tests {
     fn expect_wants_file_create(
         cor: &mut M2dirCreate,
         arg: Option<M2dirArg>,
-    ) -> BTreeMap<crate::path::M2dirPath, Vec<u8>> {
+    ) -> BTreeMap<M2dirPath, Vec<u8>> {
         match cor.resume(arg) {
             M2dirCoroutineState::Yielded(M2dirYield::WantsFileCreate(files)) => files,
             state => panic!("expected WantsFileCreate, got {state:?}"),

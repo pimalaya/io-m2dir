@@ -46,7 +46,7 @@
 //! }
 //! ```
 
-use core::fmt;
+use core::{fmt, str};
 
 use alloc::collections::{BTreeMap, BTreeSet};
 
@@ -153,6 +153,8 @@ impl fmt::Display for State {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::*;
 
     #[test]
@@ -167,7 +169,7 @@ mod tests {
         assert_eq!(files.len(), 1);
         let (path, bytes) = files.into_iter().next().unwrap();
         assert!(path.as_str().contains("entry.flags"));
-        assert_eq!(core::str::from_utf8(&bytes).unwrap(), "$seen\n");
+        assert_eq!(str::from_utf8(&bytes).unwrap(), "$seen\n");
 
         expect_complete_ok(&mut set, Some(M2dirArg::FileCreate));
     }
@@ -233,7 +235,7 @@ mod tests {
     fn expect_wants_file_create(
         cor: &mut M2dirFlagSet,
         arg: Option<M2dirArg>,
-    ) -> BTreeMap<M2dirPath, alloc::vec::Vec<u8>> {
+    ) -> BTreeMap<M2dirPath, Vec<u8>> {
         match cor.resume(arg) {
             M2dirCoroutineState::Yielded(M2dirYield::WantsFileCreate(files)) => files,
             state => panic!("expected WantsFileCreate, got {state:?}"),

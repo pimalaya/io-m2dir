@@ -19,21 +19,15 @@ pub const DOT_M2STORE: &str = ".m2store";
 /// target m2dir.
 pub const DOT_DELIVERY: &str = ".delivery";
 
-/// Errors that can occur while opening an existing m2store.
+/// Errors that can occur while operating on an m2store.
 #[derive(Clone, Debug, Error)]
-pub enum LoadM2dirStoreError {
+pub enum M2dirStoreError {
     /// The given path is not a directory.
     #[error("path {0} is not a directory")]
     NotDir(M2dirPath),
     /// The given directory does not contain the `.m2store` marker.
     #[error("no valid `.m2store` marker found in directory {0}")]
     NoDotM2store(M2dirPath),
-}
-
-/// Errors that can occur while creating a new folder inside an
-/// m2store.
-#[derive(Clone, Debug, Error)]
-pub enum NewFolderError {
     /// The given folder name resolves to an absolute path.
     #[error("folder path {0} must be relative")]
     AbsolutePath(String),
@@ -76,9 +70,9 @@ impl M2dirStore {
     ///
     /// Returns an error if `name` is absolute or escapes the store
     /// root.
-    pub fn resolve_folder_path(&self, name: &str) -> Result<M2dirPath, NewFolderError> {
+    pub fn resolve_folder_path(&self, name: &str) -> Result<M2dirPath, M2dirStoreError> {
         if name.starts_with('/') || name.starts_with('\\') {
-            return Err(NewFolderError::AbsolutePath(name.to_string()));
+            return Err(M2dirStoreError::AbsolutePath(name.to_string()));
         }
 
         let mut resolved = self.path.clone();
@@ -87,7 +81,7 @@ impl M2dirStore {
             match raw {
                 "" | "." => {}
                 ".." => {
-                    return Err(NewFolderError::EscapesRoot(name.to_string()));
+                    return Err(M2dirStoreError::EscapesRoot(name.to_string()));
                 }
                 part => {
                     let encoded = utf8_percent_encode(part, M2DIR_PCT).to_string();
